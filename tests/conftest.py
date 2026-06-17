@@ -5,6 +5,7 @@ can import fleet_api without a full Docker environment.
 import sys
 import types
 from unittest.mock import MagicMock
+import pytest
 
 
 def _make_mock_module(name: str) -> types.ModuleType:
@@ -29,3 +30,15 @@ for mod_name in (
 mock_fleet = sys.modules["langgraph_fleet"]
 mock_fleet.build_architecture = MagicMock()
 mock_fleet.FleetState = dict
+
+
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+
+
+@pytest.fixture(autouse=True)
+def clear_jobs():
+    import fleet_api
+    fleet_api._jobs.clear()
+    yield
+    fleet_api._jobs.clear()

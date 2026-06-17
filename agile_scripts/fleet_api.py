@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 from langgraph_fleet import build_architecture, FleetState
@@ -230,7 +230,7 @@ async def run_fleet(req: TicketRequest, request: Request):
     _jobs[job_id] = job
 
     if wait:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace
         )
@@ -241,10 +241,12 @@ async def run_fleet(req: TicketRequest, request: Request):
             summary=result["summary"],
         )
 
-    loop = asyncio.get_event_loop()
-    asyncio.ensure_future(
-        loop.run_in_executor(_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
-    )
+    loop = asyncio.get_running_loop()
+
+    async def _fire_and_forget() -> None:
+        await loop.run_in_executor(_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
+
+    asyncio.create_task(_fire_and_forget())
     return {"job_id": job_id, "ticket_id": req.ticket_id}
 
 
@@ -257,6 +259,5 @@ def get_all_status() -> dict:
 def get_job_status(job_id: str) -> dict:
     job = _jobs.get(job_id)
     if job is None:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=f"Job {job_id} no encontrado")
     return job.to_dict()

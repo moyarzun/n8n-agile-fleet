@@ -117,8 +117,6 @@ def test_status_empty():
     from starlette.testclient import TestClient
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
-    import fleet_api
-    fleet_api._jobs.clear()
     from fleet_api import app
     client = TestClient(app)
     r = client.get("/status")
@@ -148,15 +146,6 @@ def test_run_x_wait_returns_fleet_response(monkeypatch):
         fleet_api, "_run_fleet_worker",
         lambda job_id, ticket_id, workspace: {"approved": True, "iterations": 2, "summary": "Listo"}
     )
-    # Patch job creation so summary is set before response
-    original_worker = fleet_api._run_fleet_worker
-    def patched_worker(job_id, ticket_id, workspace):
-        result = original_worker(job_id, ticket_id, workspace)
-        fleet_api._jobs[job_id].summary = result["summary"]
-        fleet_api._jobs[job_id].status = "approved"
-        fleet_api._jobs[job_id].iteration = result["iterations"]
-        return result
-    monkeypatch.setattr(fleet_api, "_run_fleet_worker", patched_worker)
 
     client = TestClient(app)
     r = client.post("/run", json={"ticket_id": "SCRUM-7"}, headers={"X-Wait": "true"})
