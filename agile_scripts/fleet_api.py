@@ -13,7 +13,8 @@ from pydantic import BaseModel
 from langgraph_fleet import build_architecture, FleetState
 
 app = FastAPI(title="LangGraph Fleet API")
-_executor = ThreadPoolExecutor(max_workers=4)
+_async_executor = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_ASYNC_WORKERS", "8")))
+_wait_executor  = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_WAIT_WORKERS", "4")))
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ def _emit(event_name: str, data: dict) -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     global _main_loop
-    _main_loop = asyncio.get_event_loop()
+    _main_loop = asyncio.get_running_loop()
     asyncio.create_task(_broadcast_loop())
     asyncio.create_task(_cleanup_loop())
 
@@ -232,7 +233,7 @@ async def run_fleet(req: TicketRequest, request: Request):
     if wait:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
-            _executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace
+            _wait_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace
         )
         return FleetResponse(
             ticket_id=req.ticket_id,
@@ -244,7 +245,7 @@ async def run_fleet(req: TicketRequest, request: Request):
     loop = asyncio.get_running_loop()
 
     async def _fire_and_forget() -> None:
-        await loop.run_in_executor(_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
+        await loop.run_in_executor(_async_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
 
     asyncio.create_task(_fire_and_forget())
     return {"job_id": job_id, "ticket_id": req.ticket_id}
@@ -355,6 +356,7 @@ main{padding:1.5rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill
 const grid=document.getElementById('grid'),empty=document.getElementById('empty'),
       dot=document.getElementById('dot'),lbl=document.getElementById('conn-label');
 const cards={};
+const pending={};
 const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -435,9 +437,14 @@ function connect(){
   es.onerror=()=>{dot.classList.remove('on');lbl.textContent='Reconectando...';};
   es.addEventListener('job_started',e=>{
     const d=JSON.parse(e.data);
-    fetch('/status/'+d.job_id).then(r=>r.json()).then(showCard).catch(()=>{});
+    pending[d.job_id]=[];
+    fetch('/status/'+d.job_id).then(r=>r.json()).then(job=>{
+      const el=showCard(job);
+      (pending[d.job_id]||[]).forEach(u=>patchCard(u.job_id,u));
+      delete pending[d.job_id];
+    }).catch(()=>{});
   });
-  es.addEventListener('job_update',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,d);});
+  es.addEventListener('job_update',e=>{const d=JSON.parse(e.data);if(!cards[d.job_id]){if(pending[d.job_id])pending[d.job_id].push(d);return;}patchCard(d.job_id,d);});
   es.addEventListener('job_finished',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,{status:d.status});});
 }
 connect();
