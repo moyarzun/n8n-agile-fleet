@@ -155,3 +155,32 @@ def test_run_x_wait_returns_fleet_response(monkeypatch):
     assert body["ticket_id"] == "SCRUM-7"
     assert "iterations" in body
     assert "summary" in body
+
+
+def test_events_endpoint_content_type():
+    """GET /events devuelve Content-Type text/event-stream."""
+    import sys, os, threading, time
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    from fleet_api import app
+    import uvicorn, httpx
+
+    # Arranca servidor real en thread para soportar SSE infinito
+    config = uvicorn.Config(app, host="127.0.0.1", port=18765, log_level="critical")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    # Esperar hasta que el servidor esté listo
+    for _ in range(20):
+        try:
+            httpx.get("http://127.0.0.1:18765/health", timeout=0.5)
+            break
+        except Exception:
+            time.sleep(0.1)
+
+    try:
+        with httpx.stream("GET", "http://127.0.0.1:18765/events", timeout=5) as r:
+            assert r.status_code == 200
+            assert "text/event-stream" in r.headers["content-type"]
+    finally:
+        server.should_exit = True
+        thread.join(timeout=3)
