@@ -165,7 +165,8 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
 
                 log_line = ""
                 if data.get("messages"):
-                    log_line = f"[{node_name}] {data['messages'][-1].content[:200]}"
+                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    log_line = f"[{ts}] [{node_name}] {data['messages'][-1].content[:200]}"
                     job.logs.append(log_line)
                     if len(job.logs) > 100:
                         job.logs = job.logs[-100:]
@@ -380,7 +381,11 @@ function buildCard(job){
 }
 
 function cardInner(job){
-  const logLines=(job.logs||[]).slice(-10).map(l=>`<div>${esc(l)}</div>`).join('')||'<div style="color:#4a5568">Sin logs aún.</div>';
+  const logLines=(job.logs||[]).slice(-10).map(l=>{
+    const m=l.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);
+    if(m)return`<div><span style="color:#4a5568;user-select:none">${esc(m[1])} </span>${esc(m[2])}</div>`;
+    return`<div>${esc(l)}</div>`;
+  }).join('')||'<div style="color:#4a5568">Sin logs aún.</div>';
   return `<div class="card-header">
     <div>
       <div class="ticket">${esc(job.ticket_id)}</div>
@@ -418,7 +423,7 @@ function patchCard(jobId,d){
   }
   if(d.log){
     const l=document.getElementById('logs-'+jobId);
-    if(l){const div=document.createElement('div');div.textContent=d.log;l.appendChild(div);
+    if(l){const div=document.createElement('div');const m=d.log.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);div.innerHTML=m?`<span style="color:#4a5568;user-select:none">${esc(m[1])} </span>${esc(m[2])}`:esc(d.log);l.appendChild(div);
       if(l.scrollTop+l.clientHeight>=l.scrollHeight-20)l.scrollTop=l.scrollHeight;}
   }
 }

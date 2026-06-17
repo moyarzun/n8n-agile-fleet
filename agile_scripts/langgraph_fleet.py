@@ -42,7 +42,7 @@ _minimax_dev = ChatOpenAI(
     base_url="https://api.minimax.io/v1",
     model="MiniMax-M2.7",
     temperature=0.3,
-    max_tokens=8192,
+    max_tokens=40960,
 )
 
 _minimax_reviewer = ChatOpenAI(
@@ -62,7 +62,7 @@ def _make_or(model: str, temperature: float) -> ChatOpenAI:
         base_url="https://openrouter.ai/api/v1",
         model=model,
         temperature=temperature,
-        max_tokens=8192,
+        max_tokens=40960,
         default_headers={
             "HTTP-Referer": "https://veracta.atlassian.net",
             "X-Title": "Veracta LangGraph Fleet",
