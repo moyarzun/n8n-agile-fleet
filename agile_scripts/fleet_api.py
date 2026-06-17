@@ -211,3 +211,52 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
         "iterations": job.iteration,
         "summary": job.summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/run")
+async def run_fleet(req: TicketRequest, request: Request):
+    wait = request.headers.get("X-Wait", "").lower() in ("true", "1")
+    job_id = str(uuid.uuid4())
+    job = JobState(job_id=job_id, ticket_id=req.ticket_id)
+    _jobs[job_id] = job
+
+    if wait:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace
+        )
+        return FleetResponse(
+            ticket_id=req.ticket_id,
+            approved=result["approved"],
+            iterations=result["iterations"],
+            summary=result["summary"],
+        )
+
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(
+        loop.run_in_executor(_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
+    )
+    return {"job_id": job_id, "ticket_id": req.ticket_id}
+
+
+@app.get("/status")
+def get_all_status() -> dict:
+    return {jid: job.to_dict() for jid, job in _jobs.items()}
+
+
+@app.get("/status/{job_id}")
+def get_job_status(job_id: str) -> dict:
+    job = _jobs.get(job_id)
+    if job is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Job {job_id} no encontrado")
+    return job.to_dict()
