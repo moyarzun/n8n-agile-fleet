@@ -121,3 +121,93 @@ async def _cleanup_loop() -> None:
         ]
         for jid in stale:
             _jobs.pop(jid, None)
+
+
+# ---------------------------------------------------------------------------
+# Worker — corre en ThreadPoolExecutor
+# ---------------------------------------------------------------------------
+
+def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
+    """Ejecuta engine.stream() sincrónicamente. Actualiza _jobs y emite eventos SSE."""
+    job = _jobs[job_id]
+    job.status = "running"
+
+    _emit("job_started", {
+        "job_id": job_id,
+        "ticket_id": ticket_id,
+        "started_at": job.started_at,
+    })
+
+    try:
+        engine = build_architecture()
+        initial: FleetState = {
+            "messages": [],
+            "ticket_id": ticket_id,
+            "workspace_path": workspace,
+            "acceptance_criteria": "",
+            "required_agents": [],
+            "current_code_diff": {},
+            "applied_files": [],
+            "reviewer_feedback": "",
+            "is_approved": False,
+            "loop_iterations": 0,
+        }
+        final_state: dict = dict(initial)
+
+        for step_event in engine.stream(initial, stream_mode="updates"):
+            for node_name, data in step_event.items():
+                if data.get("loop_iterations") is not None:
+                    job.iteration = data["loop_iterations"]
+                if data.get("applied_files"):
+                    job.files_count = len(data["applied_files"])
+                job.phase = node_name
+
+                log_line = ""
+                if data.get("messages"):
+                    log_line = f"[{node_name}] {data['messages'][-1].content[:200]}"
+                    job.logs.append(log_line)
+                    if len(job.logs) > 100:
+                        job.logs = job.logs[-100:]
+
+                final_state.update(data)
+
+                elapsed = int(
+                    (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
+                    .total_seconds()
+                )
+                _emit("job_update", {
+                    "job_id": job_id,
+                    "phase": node_name,
+                    "iteration": job.iteration,
+                    "files_count": job.files_count,
+                    "status": "running",
+                    "log": log_line,
+                    "elapsed_s": elapsed,
+                })
+
+        job.status = "approved" if final_state.get("is_approved") else "rejected"
+        job.summary = final_state.get("reviewer_feedback", "")
+
+    except Exception as exc:
+        job.status = "error"
+        job.summary = str(exc)
+
+    job.finished_at = datetime.now(timezone.utc).isoformat()
+    elapsed = int(
+        (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
+        .total_seconds()
+    )
+    _emit("job_finished", {
+        "job_id": job_id,
+        "status": job.status,
+        "iterations": job.iteration,
+        "files_count": job.files_count,
+        "summary": job.summary,
+        "elapsed_s": elapsed,
+    })
+
+    return {
+        "approved": job.status == "approved",
+        "iterations": job.iteration,
+        "summary": job.summary,
+    }
