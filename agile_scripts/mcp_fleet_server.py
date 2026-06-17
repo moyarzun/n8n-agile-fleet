@@ -24,6 +24,7 @@ def resolver_ticket_jira(ticket_id: str) -> str:
         response = client.post(
             f"{FLEET_API_URL}/run",
             json={"ticket_id": ticket_id, "workspace": "/workspace"},
+            headers={"X-Wait": "true"},
         )
         response.raise_for_status()
         result = response.json()
