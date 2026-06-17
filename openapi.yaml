@@ -1,0 +1,255 @@
+openapi: 3.0.3
+info:
+  title: n8n-agile-fleet API
+  description: |
+    Fleet multi-agente LangGraph que resuelve tickets Jira automáticamente.
+    Ciclo dev → review → aprobación con modelos MiniMax + OpenRouter.
+  version: "1.0.0"
+  contact:
+    url: https://github.com/moyarzun/n8n-agile-fleet
+
+servers:
+  - url: http://localhost:8000
+    description: Local (Docker)
+
+tags:
+  - name: jobs
+    description: Gestión de jobs del fleet
+  - name: monitoring
+    description: Monitoreo en tiempo real
+
+paths:
+  /run:
+    post:
+      operationId: launchTicket
+      summary: Lanzar resolución de ticket Jira
+      description: |
+        Inicia la flota multi-agente para resolver un ticket Jira.
+
+        **Modo async (default):** retorna `job_id` inmediatamente. Monitorear
+        progreso en `GET /status/{job_id}` o `GET /events`.
+
+        **Modo bloqueante:** enviar header `X-Wait: true` para esperar el resultado
+        completo (compatible con clientes MCP síncronos).
+      tags: [jobs]
+      parameters:
+        - name: X-Wait
+          in: header
+          required: false
+          description: Si es `true`, espera el resultado completo antes de responder.
+          schema:
+            type: string
+            enum: ["true", "false"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketRequest'
+            example:
+              ticket_id: "PROJ-123"
+              workspace: "/workspace"
+      responses:
+        "200":
+          description: Job lanzado (async) o resultado completo (X-Wait)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JobLaunched'
+                  - $ref: '#/components/schemas/FleetResponse'
+              examples:
+                async:
+                  summary: Respuesta async (sin X-Wait)
+                  value:
+                    job_id: "c9a9df12-d4ec-4fb7-935a-ee57d747844e"
+                    ticket_id: "PROJ-123"
+                blocking:
+                  summary: Respuesta bloqueante (con X-Wait true)
+                  value:
+                    ticket_id: "PROJ-123"
+                    approved: true
+                    iterations: 3
+                    summary: "Arquitectura sólida. Servicio Express con endpoint POST /webhook..."
+
+  /status:
+    get:
+      operationId: getAllJobs
+      summary: Obtener todos los jobs activos y recientes
+      description: Retorna snapshot JSON de todos los jobs en memoria (activos + últimos completados en la hora pasada).
+      tags: [jobs]
+      responses:
+        "200":
+          description: Mapa de job_id → estado del job
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/JobState'
+
+  /status/{job_id}:
+    get:
+      operationId: getJob
+      summary: Obtener estado de un job específico
+      tags: [jobs]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Estado completo del job con todos los logs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobState'
+        "404":
+          description: Job no encontrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /events:
+    get:
+      operationId: streamEvents
+      summary: Stream de eventos SSE en tiempo real
+      description: |
+        Server-Sent Events. El cliente recibe push de eventos sin polling.
+        Reconecta automáticamente si cae la conexión.
+
+        **Eventos emitidos:**
+        - `job_started` — nuevo job iniciado
+        - `job_update` — actualización de fase/iteración/archivos
+        - `job_finished` — job completado (approved/rejected/error)
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Stream SSE
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: "text/event-stream"
+            Cache-Control:
+              schema:
+                type: string
+                example: "no-cache"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: job_started
+                data: {"job_id":"c9a9df12","ticket_id":"PROJ-123","started_at":"2026-06-17T15:00:00Z"}
+
+                event: job_update
+                data: {"job_id":"c9a9df12","phase":"dynamic_developer","iteration":1,"files_count":8,"status":"running","log":"[15:01:23] [dynamic_developer] Escribiendo graph.py...","elapsed_s":47}
+
+                event: job_finished
+                data: {"job_id":"c9a9df12","status":"approved","iterations":2,"files_count":46,"summary":"Arquitectura sólida...","elapsed_s":312}
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Servicio disponible
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+components:
+  schemas:
+    TicketRequest:
+      type: object
+      required: [ticket_id]
+      properties:
+        ticket_id:
+          type: string
+          description: ID del ticket Jira a resolver
+          example: "PROJ-123"
+        workspace:
+          type: string
+          description: Ruta al workspace dentro del contenedor
+          default: "/workspace"
+          example: "/workspace"
+
+    JobLaunched:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: ID único del job para tracking
+        ticket_id:
+          type: string
+
+    FleetResponse:
+      type: object
+      description: Resultado completo (solo con X-Wait true)
+      properties:
+        ticket_id:
+          type: string
+        approved:
+          type: boolean
+          description: true si el reviewer aprobó la implementación
+        iterations:
+          type: integer
+          description: Número de ciclos dev→review ejecutados
+        summary:
+          type: string
+          description: Resumen del reviewer o logs del proceso
+
+    JobState:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        ticket_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, approved, rejected, error]
+        phase:
+          type: string
+          enum: [context_ingestion, dynamic_developer, quality_reviewer, jira_updater]
+          description: Nodo LangGraph activo
+        iteration:
+          type: integer
+          description: Ciclo dev→review actual
+        files_count:
+          type: integer
+          description: Archivos escritos al disco acumulados
+        logs:
+          type: array
+          items:
+            type: string
+          description: Últimas 100 líneas de log con timestamp
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        summary:
+          type: string
+
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
