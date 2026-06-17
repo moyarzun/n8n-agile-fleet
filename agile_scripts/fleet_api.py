@@ -297,3 +297,155 @@ async def sse_events(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard HTML (inline, sin archivos estáticos)
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fleet Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:1rem 2rem;display:flex;align-items:center;gap:.75rem}
+header h1{font-size:1.1rem;font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;background:#fc8181;transition:background .3s}
+.dot.on{background:#48bb78;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+#conn-label{font-size:.75rem;color:#4a5568;margin-left:.25rem}
+main{padding:1.5rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(420px,1fr))}
+.empty{text-align:center;color:#4a5568;margin:4rem auto;grid-column:1/-1;font-size:.9rem}
+.empty code{background:#1a1f2e;padding:2px 6px;border-radius:4px;font-size:.85rem}
+.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:1.25rem;transition:border-color .2s}
+.card.running{border-color:#2b4c7e}
+.card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.75rem}
+.ticket{font-size:1.05rem;font-weight:700;color:#63b3ed}
+.meta{display:flex;gap:.75rem;font-size:.75rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
+.badge{font-size:.65rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em}
+.badge-running{background:#2b4c7e;color:#63b3ed}
+.badge-approved{background:#1c3a2e;color:#48bb78}
+.badge-rejected{background:#3a1c1c;color:#fc8181}
+.badge-error{background:#3a2a1c;color:#ed8936}
+.badge-queued{background:#2d3748;color:#a0aec0}
+.phase{display:flex;align-items:center;gap:.3rem}
+.pd{width:6px;height:6px;border-radius:50%;background:#718096}
+.ph-dynamic_developer .pd{background:#63b3ed}
+.ph-quality_reviewer .pd{background:#ecc94b}
+.ph-jira_updater .pd{background:#48bb78}
+.logs{background:#0f1117;border-radius:4px;padding:.6rem .75rem;font-size:.7rem;font-family:monospace;max-height:100px;overflow-y:auto;color:#a0aec0;cursor:pointer;transition:max-height .2s}
+.logs.x{max-height:260px}
+.logs-toggle{font-size:.68rem;color:#4a5568;margin-top:.3rem;cursor:pointer;user-select:none}
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>Fleet Dashboard</h1>
+  <span id="conn-label">Conectando...</span>
+</header>
+<main id="grid">
+  <div class="empty" id="empty">No hay jobs activos. Inicia uno con <code>POST /run</code>.</div>
+</main>
+<script>
+const grid=document.getElementById('grid'),empty=document.getElementById('empty'),
+      dot=document.getElementById('dot'),lbl=document.getElementById('conn-label');
+const cards={};
+const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function elapsed(iso){
+  const s=Math.floor((Date.now()-new Date(iso))/1000);
+  if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';
+  return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';
+}
+
+function buildCard(job){
+  const el=document.createElement('div');
+  el.className='card'+(job.status==='running'?' running':'');
+  el.id='card-'+job.job_id;
+  el.innerHTML=cardInner(job);
+  el.querySelector('.logs').addEventListener('click',()=>{
+    const l=el.querySelector('.logs'),t=el.querySelector('.logs-toggle');
+    l.classList.toggle('x');
+    t.textContent=l.classList.contains('x')?'▲ colapsar':'▼ expandir';
+  });
+  return el;
+}
+
+function cardInner(job){
+  const logLines=(job.logs||[]).slice(-10).map(l=>`<div>${esc(l)}</div>`).join('')||'<div style="color:#4a5568">Sin logs aún.</div>';
+  return `<div class="card-header">
+    <div>
+      <div class="ticket">${esc(job.ticket_id)}</div>
+      <div class="meta">
+        <span class="phase ph-${job.phase}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
+        <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
+        <span><b id="files-${job.job_id}">${job.files_count}</b> archivos</span>
+        <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${job.finished_at?elapsed(job.started_at):elapsed(job.started_at)}</span>
+      </div>
+    </div>
+    <span class="badge badge-${job.status}" id="badge-${job.job_id}">${job.status}</span>
+  </div>
+  <div class="logs" id="logs-${job.job_id}">${logLines}</div>
+  <div class="logs-toggle">▼ expandir</div>`;
+}
+
+function showCard(job){
+  let el=document.getElementById('card-'+job.job_id);
+  if(!el){el=buildCard(job);cards[job.job_id]=el;grid.insertBefore(el,grid.firstChild);empty.style.display='none';}
+  return el;
+}
+
+function patchCard(jobId,d){
+  if(d.phase!==undefined){
+    const c=document.querySelector(`#card-${jobId} .phase`);
+    if(c){c.className=`phase ph-${d.phase}`;c.innerHTML=`<span class="pd"></span>${PHASE_NAMES[d.phase]||d.phase}`;}
+  }
+  if(d.iteration!==undefined){const e=document.getElementById('iter-'+jobId);if(e)e.textContent=d.iteration;}
+  if(d.files_count!==undefined){const e=document.getElementById('files-'+jobId);if(e)e.textContent=d.files_count;}
+  if(d.status!==undefined){
+    const b=document.getElementById('badge-'+jobId);
+    if(b){b.className='badge badge-'+d.status;b.textContent=d.status;}
+    const c=document.getElementById('card-'+jobId);
+    if(c)c.className='card'+(d.status==='running'?' running':'');
+  }
+  if(d.log){
+    const l=document.getElementById('logs-'+jobId);
+    if(l){const div=document.createElement('div');div.textContent=d.log;l.appendChild(div);
+      if(l.scrollTop+l.clientHeight>=l.scrollHeight-20)l.scrollTop=l.scrollHeight;}
+  }
+}
+
+setInterval(()=>{
+  document.querySelectorAll('.elapsed[data-started]').forEach(el=>{el.textContent=elapsed(el.dataset.started);});
+},1000);
+
+fetch('/status').then(r=>r.json()).then(jobs=>{
+  Object.values(jobs).forEach(showCard);
+});
+
+function connect(){
+  const es=new EventSource('/events');
+  es.onopen=()=>{dot.classList.add('on');lbl.textContent='Conectado';};
+  es.onerror=()=>{dot.classList.remove('on');lbl.textContent='Reconectando...';};
+  es.addEventListener('job_started',e=>{
+    const d=JSON.parse(e.data);
+    fetch('/status/'+d.job_id).then(r=>r.json()).then(showCard).catch(()=>{});
+  });
+  es.addEventListener('job_update',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,d);});
+  es.addEventListener('job_finished',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,{status:d.status});});
+}
+connect();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
+    return _DASHBOARD_HTML

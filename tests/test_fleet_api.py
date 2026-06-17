@@ -184,3 +184,17 @@ def test_events_endpoint_content_type():
     finally:
         server.should_exit = True
         thread.join(timeout=3)
+
+
+def test_dashboard_returns_html():
+    from starlette.testclient import TestClient
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    from fleet_api import app
+    client = TestClient(app)
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "EventSource" in r.text
+    assert "/events" in r.text
+    assert "/status" in r.text
