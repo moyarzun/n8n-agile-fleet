@@ -1,0 +1,72 @@
+services:
+  n8n-mcp-fleet:
+    build: .
+    container_name: n8n-agile-fleet
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=UTC
+      - TZ=UTC
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - JIRA_URL=${JIRA_URL}
+      - JIRA_USER=${JIRA_USER}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./agile_scripts:/data/scripts
+      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+    depends_on:
+      fleet-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  fleet-api:
+    build: .
+    container_name: langgraph-fleet-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - JIRA_URL=${JIRA_URL}
+      - JIRA_USER=${JIRA_USER}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
+    volumes:
+      - ./agile_scripts:/data/scripts
+      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+    working_dir: /data/scripts
+    command: ["uvicorn", "fleet_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  mcp-fleet-server:
+    build: .
+    container_name: mcp-fleet-server
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - FLEET_API_URL=http://langgraph-fleet-api:8000
+    volumes:
+      - ./agile_scripts:/data/scripts
+    working_dir: /data/scripts
+    command: ["uvicorn", "mcp_fleet_server:mcp", "--host", "0.0.0.0", "--port", "8001"]
+    depends_on:
+      fleet-api:
+        condition: service_healthy
+
+volumes:
+  n8n_data:
