@@ -2,9 +2,10 @@ import os
 import subprocess
 import argparse
 import logging
+import threading
 import re as _re
 import json as _json
-from typing import TypedDict, Annotated, List, Dict
+from typing import TypedDict, Annotated, List, Dict, Optional, Callable
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
@@ -14,6 +15,22 @@ from openai import RateLimitError, APIStatusError
 from atlassian import Jira
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Callback de logging por hilo (thread-safe para jobs concurrentes)
+# ---------------------------------------------------------------------------
+_thread_local = threading.local()
+
+def set_log_callback(fn: Callable[[str], None]) -> None:
+    _thread_local.log_callback = fn
+
+def _log(message: str) -> None:
+    fn = getattr(_thread_local, "log_callback", None)
+    if fn:
+        try:
+            fn(message)
+        except Exception:
+            pass
 
 # ===========================================================================
 # 1. Credenciales — inyectadas como env vars, nunca hardcodeadas
@@ -248,14 +265,21 @@ class ReviewerDecision(BaseModel):
 # ===========================================================================
 def fetch_and_plan_node(state: FleetState) -> dict:
     ticket_id   = state["ticket_id"]
+    _log(f"[context_ingestion] Leyendo ticket {ticket_id} desde Jira...")
     issue_data  = jira_client.issue(ticket_id)
     summary     = issue_data["fields"]["summary"]
     description = issue_data["fields"]["description"] or ""
     labels      = issue_data["fields"].get("labels", [])
 
+    _log(f"[context_ingestion] Ticket: {summary}")
+
     required_agents = [lbl.split(":")[1] for lbl in labels if lbl.startswith("agent:")]
     if not required_agents:
         required_agents = ["Full-Stack"]
+
+    _log(f"[context_ingestion] Agentes asignados: {required_agents}")
+    desc_preview = (description[:120] + "...") if len(description) > 120 else description
+    _log(f"[context_ingestion] Criterios: {desc_preview}")
 
     context_string = f"TITULO: {summary}\n\nCRITERIOS DE ACEPTACION:\n{description}"
     return {
@@ -299,11 +323,21 @@ def dynamic_developer_node(state: FleetState) -> dict:
         "===FILE_END===\n"
     )
 
+    cycle = state["loop_iterations"] + 1
+    _log(f"[dynamic_developer] --- Ciclo {cycle} ---")
+    if feedback and feedback != "Implementacion inicial requerida.":
+        _log(f"[dynamic_developer] Feedback del revisor: {feedback[:150]}")
+
     for agent_role in agents:
         system_instruction = (
             f"Eres un experto en {agent_role}. Tu unica tarea es escribir codigo.\n"
             "NO expliques nada. NO describas lo que vas a hacer.\n"
             "SOLO escribe los archivos usando el formato especificado.\n\n"
+            "CRITICO — REGLAS ANTI-TRUNCACION:\n"
+            "1. Cada archivo debe estar COMPLETO desde la primera hasta la ultima linea.\n"
+            "2. NUNCA uses '...', '# rest of implementation', '// TODO', '# continua...' ni ningun placeholder.\n"
+            "3. Si un archivo seria muy grande, divídelo en archivos mas pequeños cohesivos en lugar de truncar.\n"
+            "4. El ultimo caracter de cada bloque FILE_BEGIN/FILE_END debe ser el cierre real del archivo.\n\n"
             + FORMAT_EXAMPLE
         )
         human_instruction = (
@@ -316,32 +350,40 @@ def dynamic_developer_node(state: FleetState) -> dict:
             "Empieza directamente con el primer ===FILE_BEGIN==="
         )
 
+        _log(f"[dynamic_developer] Agente '{agent_role}': llamando al modelo LLM...")
         response      = _invoke_dev([SystemMessage(content=system_instruction),
                                      HumanMessage(content=human_instruction)])
         response_text = response.content
         new_diffs[agent_role] = response_text
 
+        blocks = len(_re.findall(r"===FILE_BEGIN:", response_text))
+        _log(f"[dynamic_developer] Respuesta recibida ({len(response_text)} chars, {blocks} bloques FILE_BEGIN detectados)")
+
         try:
             applied = _apply_workspace_changes(workspace, response_text)
-            # Acumular solo nuevos (evitar duplicados)
             for f in applied:
                 if f not in all_applied:
                     all_applied.append(f)
             if applied:
+                _log(f"[dynamic_developer] Archivos escritos: {', '.join(applied[:8])}" +
+                     (f" (+{len(applied)-8} más)" if len(applied) > 8 else ""))
                 logger.info("Agente %s aplico cambios en: %s", agent_role, applied)
             else:
+                _log(f"[dynamic_developer] AVISO: el agente '{agent_role}' no generó bloques FILE_BEGIN/END válidos")
                 logger.warning("Agente %s no genero bloques FILE_BEGIN/END", agent_role)
         except Exception as e:
+            _log(f"[dynamic_developer] ERROR aplicando archivos: {e}")
             logger.error("Error aplicando cambios del agente %s: %s", agent_role, e)
 
     summary_msg = (
-        f"Ciclo {state['loop_iterations'] + 1} completado. "
+        f"Ciclo {cycle} completado. "
         f"Total archivos en disco: {len(all_applied)}"
     )
+    _log(f"[dynamic_developer] Ciclo {cycle} completado — {len(all_applied)} archivos totales en disco")
     return {
         "current_code_diff": new_diffs,
         "applied_files":     all_applied,
-        "loop_iterations":   state["loop_iterations"] + 1,
+        "loop_iterations":   cycle,
         "messages":          [AIMessage(content=summary_msg, name="DevFleet")],
     }
 
@@ -350,13 +392,17 @@ def _read_applied_files(workspace: str, applied_files: list, max_bytes: int = 30
     """Lee el contenido actual de los archivos que realmente fueron escritos al disco."""
     if not applied_files:
         return "(ningún archivo fue escrito al disco)"
+    # Presupuesto dinámico: más bytes por archivo cuando hay pocos archivos
+    n = min(len(applied_files), 40)
+    budget_per_file = min(max(max_bytes, 200_000 // max(n, 1)), 40_000)
     parts = [f"# Archivos creados/modificados ({len(applied_files)} total):"]
-    for rel_path in applied_files[:40]:  # max 40 archivos al revisor
+    for rel_path in applied_files[:40]:
         full_path = os.path.join(workspace, rel_path)
         try:
             with open(full_path, "r", errors="replace") as fh:
-                content = fh.read(max_bytes)
-            parts.append(f"\n===FILE: {rel_path}===\n{content}\n===END===")
+                content = fh.read(budget_per_file)
+            truncated = "" if len(content) < budget_per_file else "\n[... archivo truncado por límite de lectura ...]"
+            parts.append(f"\n===FILE: {rel_path}===\n{content}{truncated}\n===END===")
         except Exception as e:
             parts.append(f"\n[No se pudo leer {rel_path}: {e}]")
     return "\n".join(parts)
@@ -368,8 +414,11 @@ def reviewer_node(state: FleetState) -> dict:
     criteria       = state["acceptance_criteria"]
     applied_files  = state.get("applied_files", [])
 
+    _log(f"[quality_reviewer] Revisando {len(applied_files)} archivos contra criterios de aceptación...")
+
     # Fast-reject: si el desarrollador no escribió ningún archivo, no llamar al LLM
     if not applied_files:
+        _log("[quality_reviewer] RECHAZO RÁPIDO: no se generó ningún archivo con formato FILE_BEGIN/END")
         logger.warning("Reviewer fast-reject: el desarrollador no generó ningún archivo en esta iteración.")
         return {
             "reviewer_feedback": "El desarrollador no generó ningún archivo con el formato FILE_BEGIN/END. Debes usar EXACTAMENTE el formato especificado y escribir TODOS los archivos del servicio.",
@@ -378,6 +427,9 @@ def reviewer_node(state: FleetState) -> dict:
 
     # Leer el contenido REAL de los archivos escritos (no el workspace genérico)
     files_content = _read_applied_files(workspace, applied_files)
+    _log(f"[quality_reviewer] Archivos a revisar: {', '.join(applied_files[:6])}" +
+         (f" (+{len(applied_files)-6} más)" if len(applied_files) > 6 else ""))
+    _log("[quality_reviewer] Llamando al modelo revisor...")
 
     sys_prompt = SystemMessage(
         content=(
@@ -397,6 +449,10 @@ def reviewer_node(state: FleetState) -> dict:
     )
 
     decision: ReviewerDecision = _invoke_reviewer_structured([sys_prompt, human_prompt])
+
+    verdict = "APROBADO ✓" if decision.is_approved else "RECHAZADO ✗"
+    _log(f"[quality_reviewer] {verdict}: {decision.corrective_feedback[:200]}")
+
     return {
         "reviewer_feedback": decision.corrective_feedback,
         "is_approved":       decision.is_approved,
@@ -414,43 +470,85 @@ def finalize_and_update_jira(state: FleetState) -> dict:
     feedback     = state["reviewer_feedback"]
     iterations   = state["loop_iterations"]
     applied      = state.get("applied_files", [])
+    is_approved  = state.get("is_approved", False)
     status_parts = []
 
-    # Comentar en Jira (no fatal si falla por permisos)
+    result_label = "APROBADO" if is_approved else f"AGOTADO (max ciclos={iterations})"
+    _log(f"[jira_updater] Finalizando — resultado: {result_label}")
+
     comment = (
         f"Implementacion procesada por la Flota de Agentes\n\n"
         f"Ciclos de revision: {iterations}\n"
         f"Archivos modificados: {len(applied)}\n\n"
         f"Resultado del revisor:\n{feedback}"
     )
+    _log(f"[jira_updater] Añadiendo comentario en {ticket_id}...")
     try:
         jira_client.issue_add_comment(ticket_id, comment)
         status_parts.append("comentario añadido")
+        _log(f"[jira_updater] Comentario añadido OK")
     except Exception as e:
         logger.warning("No se pudo comentar en %s: %s", ticket_id, e)
         status_parts.append(f"comentario omitido ({e})")
+        _log(f"[jira_updater] No se pudo comentar: {e}")
 
-    # Transicionar el ticket
+    _log(f"[jira_updater] Buscando transición de estado...")
     try:
         transitions     = jira_client.get_issue_transitions(ticket_id)
-        target_keywords = ["done", "resolved", "in review", "closed", "hecho", "resuelto"]
+        target_keywords = ["done", "resolved", "in review", "closed", "hecho", "resuelto", "finalizado", "en revisión"]
         for transition in transitions:
             to_value    = transition.get("to", "")
             target_name = (to_value if isinstance(to_value, str) else to_value.get("name", "")).lower()
             if any(kw in target_name for kw in target_keywords):
-                jira_client.transition_issue(ticket_id, str(transition["id"]))
+                jira_client.issue_transition(ticket_id, int(transition["id"]))
                 status_parts.append(f"transicionado a '{target_name}'")
+                _log(f"[jira_updater] Ticket transicionado a '{target_name}' ✓")
                 break
     except Exception as e:
         logger.warning("No se pudo transicionar %s: %s", ticket_id, e)
         status_parts.append(f"transicion omitida ({e})")
+        _log(f"[jira_updater] No se pudo transicionar: {e}")
 
     msg = "Jira: " + "; ".join(status_parts) if status_parts else "Jira actualizado."
+    _log(f"[jira_updater] Listo. {msg}")
     return {"messages": [AIMessage(content=msg, name="JiraOps")]}
 
 
 # ===========================================================================
-# 5. Enrutador condicional (quality gate)
+# 5. Parada grácil iniciada por el usuario
+# ===========================================================================
+def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied_files: list) -> None:
+    """Comenta el estado actual en Jira y transiciona el ticket a Bloqueado."""
+    files_list = "\n".join(f"  - {f}" for f in applied_files) if applied_files else "  (ninguno)"
+    comment = (
+        f"⚠️ *Ejecución detenida por el usuario.*\n\n"
+        f"*Fase al detenerse:* {current_phase or '—'}\n"
+        f"*Ciclos completados:* {iterations}\n"
+        f"*Archivos escritos al disco:* {len(applied_files)}\n"
+        f"{files_list}\n\n"
+        f"El ticket fue movido a *Bloqueado* para revisión manual."
+    )
+    try:
+        jira_client.issue_add_comment(ticket_id, comment)
+    except Exception as e:
+        logger.warning("stop_gracefully: no se pudo comentar en %s: %s", ticket_id, e)
+
+    try:
+        transitions = jira_client.get_issue_transitions(ticket_id)
+        for transition in transitions:
+            to_value = transition.get("to", "")
+            name = (to_value if isinstance(to_value, str) else to_value.get("name", "")).lower()
+            if "bloquead" in name or "blocked" in name:
+                jira_client.issue_transition(ticket_id, int(transition["id"]))
+                logger.info("stop_gracefully: %s → Bloqueado", ticket_id)
+                return
+        logger.warning("stop_gracefully: no se encontró transición a Bloqueado en %s", ticket_id)
+    except Exception as e:
+        logger.warning("stop_gracefully: no se pudo transicionar %s: %s", ticket_id, e)
+
+
+# ===========================================================================
+# 7. Enrutador condicional (quality gate)
 # ===========================================================================
 def quality_gate_router(state: FleetState) -> str:
     if state["loop_iterations"] >= 6 or state["is_approved"]:
@@ -459,7 +557,7 @@ def quality_gate_router(state: FleetState) -> str:
 
 
 # ===========================================================================
-# 6. Construccion del grafo
+# 8. Construccion del grafo
 # ===========================================================================
 def build_architecture() -> StateGraph:
     graph = StateGraph(FleetState)
@@ -481,7 +579,7 @@ def build_architecture() -> StateGraph:
 
 
 # ===========================================================================
-# 7. Entrypoint — invocado por fleet_api.py o directo via CLI
+# 9. Entrypoint — invocado por fleet_api.py o directo via CLI
 # ===========================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Flota multi-agente LangGraph para tickets de Jira")

@@ -2,6 +2,7 @@ import os
 import uuid
 import asyncio
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
-from langgraph_fleet import build_architecture, FleetState
+from langgraph_fleet import build_architecture, FleetState, stop_gracefully, set_log_callback
 
 app = FastAPI(title="LangGraph Fleet API")
 _async_executor = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_ASYNC_WORKERS", "8")))
@@ -66,6 +67,7 @@ class JobState:
 # ---------------------------------------------------------------------------
 
 _jobs: Dict[str, JobState] = {}
+_stop_flags: Dict[str, threading.Event] = {}
 _subscribers: List[asyncio.Queue] = []
 _event_queue: asyncio.Queue = asyncio.Queue()
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -128,7 +130,7 @@ async def _cleanup_loop() -> None:
 # Worker — corre en ThreadPoolExecutor
 # ---------------------------------------------------------------------------
 
-def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
+def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: threading.Event) -> dict:
     """Ejecuta engine.stream() sincrónicamente. Actualiza _jobs y emite eventos SSE."""
     job = _jobs[job_id]
     job.status = "running"
@@ -138,6 +140,29 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
         "ticket_id": ticket_id,
         "started_at": job.started_at,
     })
+
+    # Conectar callback de logging verboso al SSE + job.logs
+    def _progress_log(message: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"[{ts}] {message}"
+        job.logs.append(line)
+        if len(job.logs) > 100:
+            job.logs = job.logs[-100:]
+        elapsed = int(
+            (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
+            .total_seconds()
+        )
+        _emit("job_update", {
+            "job_id": job_id,
+            "phase": job.phase,
+            "iteration": job.iteration,
+            "files_count": job.files_count,
+            "status": "running",
+            "log": line,
+            "elapsed_s": elapsed,
+        })
+
+    set_log_callback(_progress_log)
 
     try:
         engine = build_architecture()
@@ -187,12 +212,27 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str) -> dict:
                     "elapsed_s": elapsed,
                 })
 
-        job.status = "approved" if final_state.get("is_approved") else "rejected"
-        job.summary = final_state.get("reviewer_feedback", "")
+            # Chequear flag de parada entre steps (grácil: termina el step actual antes de parar)
+            if stop_flag.is_set():
+                stop_gracefully(
+                    ticket_id=ticket_id,
+                    current_phase=job.phase,
+                    iterations=job.iteration,
+                    applied_files=final_state.get("applied_files", []),
+                )
+                job.status = "stopped"
+                job.summary = "Detenido por el usuario."
+                break
+        else:
+            job.status = "approved" if final_state.get("is_approved") else "rejected"
+            job.summary = final_state.get("reviewer_feedback", "")
 
     except Exception as exc:
         job.status = "error"
         job.summary = str(exc)
+
+    finally:
+        _stop_flags.pop(job_id, None)
 
     job.finished_at = datetime.now(timezone.utc).isoformat()
     elapsed = int(
@@ -226,15 +266,29 @@ def health() -> dict:
 
 @app.post("/run")
 async def run_fleet(req: TicketRequest, request: Request):
+    # Deduplicación: rechazar si el ticket ya tiene un job activo
+    active = next(
+        (job for job in _jobs.values()
+         if job.ticket_id == req.ticket_id and job.status in ("queued", "running")),
+        None,
+    )
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket {req.ticket_id} ya está siendo procesado (job_id={active.job_id})",
+        )
+
     wait = request.headers.get("X-Wait", "").lower() in ("true", "1")
     job_id = str(uuid.uuid4())
     job = JobState(job_id=job_id, ticket_id=req.ticket_id)
     _jobs[job_id] = job
+    stop_flag = threading.Event()
+    _stop_flags[job_id] = stop_flag
 
     if wait:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
-            _wait_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace
+            _wait_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace, stop_flag
         )
         return FleetResponse(
             ticket_id=req.ticket_id,
@@ -246,10 +300,23 @@ async def run_fleet(req: TicketRequest, request: Request):
     loop = asyncio.get_running_loop()
 
     async def _fire_and_forget() -> None:
-        await loop.run_in_executor(_async_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace)
+        await loop.run_in_executor(_async_executor, _run_fleet_worker, job_id, req.ticket_id, req.workspace, stop_flag)
 
     asyncio.create_task(_fire_and_forget())
     return {"job_id": job_id, "ticket_id": req.ticket_id}
+
+
+@app.post("/stop/{job_id}")
+async def stop_job(job_id: str):
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} no encontrado")
+    if job.status not in ("queued", "running"):
+        raise HTTPException(status_code=409, detail=f"Job {job_id} ya finalizó (status={job.status})")
+    flag = _stop_flags.get(job_id)
+    if flag:
+        flag.set()
+    return {"job_id": job_id, "stopping": True}
 
 
 @app.get("/status")
@@ -342,6 +409,13 @@ main{padding:1.5rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill
 .logs{background:#0f1117;border-radius:4px;padding:.6rem .75rem;font-size:.7rem;font-family:monospace;max-height:100px;overflow-y:auto;color:#a0aec0;cursor:pointer;transition:max-height .2s}
 .logs.x{max-height:260px}
 .logs-toggle{font-size:.68rem;color:#4a5568;margin-top:.3rem;cursor:pointer;user-select:none}
+.spinner{width:20px;height:20px;border:2.5px solid #2b4c7e;border-top-color:#63b3ed;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.badge-stopped{background:#2d2a3a;color:#b794f4}
+.card-status{display:flex;align-items:center;gap:.5rem}
+.btn-stop{font-size:.65rem;font-weight:600;padding:3px 10px;border-radius:6px;border:1px solid #4a3060;background:#2d2040;color:#d6bcfa;cursor:pointer;transition:background .15s,opacity .15s;letter-spacing:.03em}
+.btn-stop:hover{background:#3d2a5a}
+.btn-stop:disabled{opacity:.45;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -386,6 +460,13 @@ function cardInner(job){
     if(m)return`<div><span style="color:#4a5568;user-select:none">${esc(m[1])} </span>${esc(m[2])}</div>`;
     return`<div>${esc(l)}</div>`;
   }).join('')||'<div style="color:#4a5568">Sin logs aún.</div>';
+  const isRunning=job.status==='running';
+  const statusEl=isRunning
+    ?`<div class="spinner" id="badge-${job.job_id}"></div>`
+    :`<span class="badge badge-${job.status}" id="badge-${job.job_id}">${job.status}</span>`;
+  const stopBtn=isRunning
+    ?`<button class="btn-stop" id="stop-${job.job_id}" onclick="stopJob('${job.job_id}')">⏹ Detener</button>`
+    :'';
   return `<div class="card-header">
     <div>
       <div class="ticket">${esc(job.ticket_id)}</div>
@@ -393,10 +474,10 @@ function cardInner(job){
         <span class="phase ph-${job.phase}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
         <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
         <span><b id="files-${job.job_id}">${job.files_count}</b> archivos</span>
-        <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${job.finished_at?elapsed(job.started_at):elapsed(job.started_at)}</span>
+        <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${elapsed(job.started_at)}</span>
       </div>
     </div>
-    <span class="badge badge-${job.status}" id="badge-${job.job_id}">${job.status}</span>
+    <div class="card-status">${stopBtn}${statusEl}</div>
   </div>
   <div class="logs" id="logs-${job.job_id}">${logLines}</div>
   <div class="logs-toggle">▼ expandir</div>`;
@@ -417,7 +498,18 @@ function patchCard(jobId,d){
   if(d.files_count!==undefined){const e=document.getElementById('files-'+jobId);if(e)e.textContent=d.files_count;}
   if(d.status!==undefined){
     const b=document.getElementById('badge-'+jobId);
-    if(b){b.className='badge badge-'+d.status;b.textContent=d.status;}
+    if(b){
+      if(d.status==='running'){
+        b.className='spinner';
+        b.textContent='';
+      } else {
+        b.className='badge badge-'+d.status;
+        b.textContent=d.status;
+        // Eliminar botón Detener cuando el job ya no está running
+        const btn=document.getElementById('stop-'+jobId);
+        if(btn) btn.remove();
+      }
+    }
     const c=document.getElementById('card-'+jobId);
     if(c)c.className='card'+(d.status==='running'?' running':'');
   }
@@ -435,6 +527,14 @@ setInterval(()=>{
 fetch('/status').then(r=>r.json()).then(jobs=>{
   Object.values(jobs).forEach(showCard);
 });
+
+function stopJob(jobId){
+  const btn=document.getElementById('stop-'+jobId);
+  if(btn){btn.disabled=true;btn.textContent='Deteniendo…';}
+  fetch('/stop/'+jobId,{method:'POST'})
+    .then(r=>{if(!r.ok)throw new Error(r.status);})
+    .catch(()=>{if(btn){btn.disabled=false;btn.textContent='⏹ Detener';}});
+}
 
 function connect(){
   const es=new EventSource('/events');
