@@ -2,6 +2,7 @@ import os
 import uuid
 import asyncio
 import json
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -63,6 +64,84 @@ class JobState:
 
 
 # ---------------------------------------------------------------------------
+# Persistencia SQLite (comparte volumen n8n_data)
+# ---------------------------------------------------------------------------
+
+_DB_PATH = os.getenv("FLEET_DB", "/data/n8n_store/fleet.db")
+_db_lock = threading.Lock()
+
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    with _db_lock:
+        conn = _db_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id      TEXT PRIMARY KEY,
+                ticket_id   TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                phase       TEXT DEFAULT '',
+                iteration   INTEGER DEFAULT 0,
+                files_count INTEGER DEFAULT 0,
+                summary     TEXT DEFAULT '',
+                started_at  TEXT,
+                finished_at TEXT,
+                logs        TEXT DEFAULT '[]'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+
+def _persist_job(job: "JobState") -> None:
+    with _db_lock:
+        conn = _db_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO jobs
+              (job_id, ticket_id, status, phase, iteration, files_count,
+               summary, started_at, finished_at, logs)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (
+            job.job_id, job.ticket_id, job.status, job.phase,
+            job.iteration, job.files_count, job.summary,
+            job.started_at, job.finished_at,
+            json.dumps(job.logs[-500:]),
+        ))
+        conn.commit()
+        conn.close()
+
+
+def _load_jobs_from_db() -> Dict[str, "JobState"]:
+    jobs: Dict[str, "JobState"] = {}
+    try:
+        with _db_lock:
+            conn = _db_conn()
+            rows = conn.execute(
+                "SELECT * FROM jobs ORDER BY started_at DESC LIMIT 1000"
+            ).fetchall()
+            conn.close()
+        for row in rows:
+            j = JobState(job_id=row["job_id"], ticket_id=row["ticket_id"])
+            j.status      = row["status"]
+            j.phase       = row["phase"] or ""
+            j.iteration   = row["iteration"] or 0
+            j.files_count = row["files_count"] or 0
+            j.summary     = row["summary"] or ""
+            j.started_at  = row["started_at"]
+            j.finished_at = row["finished_at"]
+            j.logs        = json.loads(row["logs"] or "[]")
+            jobs[j.job_id] = j
+    except Exception as exc:
+        print(f"[fleet] Aviso: no se cargaron jobs desde DB: {exc}")
+    return jobs
+
+
+# ---------------------------------------------------------------------------
 # Estado global
 # ---------------------------------------------------------------------------
 
@@ -107,8 +186,11 @@ def _emit(event_name: str, data: dict) -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _main_loop
+    global _main_loop, _jobs
     _main_loop = asyncio.get_running_loop()
+    _init_db()
+    _jobs = _load_jobs_from_db()
+    print(f"[fleet] DB cargada: {len(_jobs)} jobs restaurados desde {_DB_PATH}")
     asyncio.create_task(_broadcast_loop())
     asyncio.create_task(_cleanup_loop())
 
@@ -146,8 +228,8 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         line = f"[{ts}] {message}"
         job.logs.append(line)
-        if len(job.logs) > 100:
-            job.logs = job.logs[-100:]
+        if len(job.logs) > 500:
+            job.logs = job.logs[-500:]
         elapsed = int(
             (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
             .total_seconds()
@@ -161,6 +243,9 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
             "log": line,
             "elapsed_s": elapsed,
         })
+        # Persistir cada 20 líneas para no saturar SQLite
+        if len(job.logs) % 20 == 0:
+            _persist_job(job)
 
     set_log_callback(_progress_log)
 
@@ -235,6 +320,7 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
         _stop_flags.pop(job_id, None)
 
     job.finished_at = datetime.now(timezone.utc).isoformat()
+    _persist_job(job)
     elapsed = int(
         (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
         .total_seconds()
@@ -282,6 +368,7 @@ async def run_fleet(req: TicketRequest, request: Request):
     job_id = str(uuid.uuid4())
     job = JobState(job_id=job_id, ticket_id=req.ticket_id)
     _jobs[job_id] = job
+    _persist_job(job)
     stop_flag = threading.Event()
     _stop_flags[job_id] = stop_flag
 
