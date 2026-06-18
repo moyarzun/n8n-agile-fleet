@@ -381,22 +381,36 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:.75rem 1.25rem;display:flex;align-items:center;gap:.75rem;position:sticky;top:0;z-index:10}
-header h1{font-size:1rem;font-weight:600}
+header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:.65rem 1.1rem;display:flex;align-items:center;gap:.6rem;position:sticky;top:0;z-index:10}
+header h1{font-size:.95rem;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dot{width:8px;height:8px;border-radius:50%;background:#fc8181;transition:background .3s;flex-shrink:0}
 .dot.on{background:#48bb78;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-#conn-label{font-size:.75rem;color:#4a5568;margin-left:.25rem}
-main{padding:1rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr))}
-@media(max-width:480px){main{padding:.75rem .5rem;gap:.75rem}}
+#conn-label{font-size:.72rem;color:#4a5568;white-space:nowrap}
+.btn-hdr{font-size:.72rem;font-weight:600;padding:4px 10px;border-radius:6px;border:1px solid #2d3748;background:#232b3e;color:#a0aec0;cursor:pointer;white-space:nowrap;flex-shrink:0;transition:background .15s,color .15s}
+.btn-hdr:hover{background:#2d3748;color:#e2e8f0}
+/* ── Layout ── */
+main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr))}
 .empty{text-align:center;color:#4a5568;margin:4rem auto;grid-column:1/-1;font-size:.9rem}
 .empty code{background:#1a1f2e;padding:2px 6px;border-radius:4px;font-size:.85rem}
-.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:1rem;transition:border-color .2s}
+/* ── Paginación ── */
+.pagination{display:flex;align-items:center;gap:.5rem;padding:.6rem 1rem;background:#1a1f2e;border-top:1px solid #2d3748;position:sticky;bottom:0;z-index:9}
+.pagination select{background:#0f1117;color:#a0aec0;border:1px solid #2d3748;border-radius:5px;padding:3px 6px;font-size:.72rem;cursor:pointer}
+.pagination select:focus{outline:none;border-color:#4a5568}
+.pg-btn{background:#232b3e;border:1px solid #2d3748;color:#a0aec0;border-radius:5px;padding:3px 9px;font-size:.8rem;cursor:pointer;transition:background .15s}
+.pg-btn:hover:not(:disabled){background:#2d3748;color:#e2e8f0}
+.pg-btn:disabled{opacity:.35;cursor:not-allowed}
+#page-info{font-size:.72rem;color:#718096;min-width:4rem;text-align:center}
+.pg-spacer{flex:1}
+/* ── Tarjeta ── */
+.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.9rem;transition:border-color .2s}
 .card.running{border-color:#2b4c7e}
-.card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.75rem;gap:.5rem}
-.ticket{font-size:1rem;font-weight:700;color:#63b3ed;word-break:break-word}
-.meta{display:flex;gap:.5rem;font-size:.72rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
-.badge{font-size:.62rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+.card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:.5rem}
+.card-info{min-width:0;flex:1}
+.ticket{font-size:.98rem;font-weight:700;color:#63b3ed;word-break:break-word}
+.meta{display:flex;gap:.45rem;font-size:.71rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
+.card-body{margin-top:.7rem}
+.badge{font-size:.6rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .badge-running{background:#2b4c7e;color:#63b3ed}
 .badge-approved{background:#1c3a2e;color:#48bb78}
 .badge-rejected{background:#3a1c1c;color:#fc8181}
@@ -408,30 +422,54 @@ main{padding:1rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,m
 .ph-dynamic_developer .pd{background:#63b3ed}
 .ph-quality_reviewer .pd{background:#ecc94b}
 .ph-jira_updater .pd{background:#48bb78}
-.logs-preview{background:#0f1117;border-radius:4px;padding:.5rem .6rem;font-size:.68rem;font-family:monospace;max-height:72px;overflow:hidden;color:#a0aec0;line-height:1.4}
-.logs-toggle{font-size:.68rem;color:#4a5568;margin-top:.35rem;cursor:pointer;user-select:none;display:flex;align-items:center;gap:.3rem;width:fit-content}
+.logs-preview{background:#0f1117;border-radius:4px;padding:.45rem .6rem;font-size:.67rem;font-family:monospace;max-height:66px;overflow:hidden;color:#a0aec0;line-height:1.4}
+.logs-toggle{font-size:.67rem;color:#4a5568;margin-top:.3rem;cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:.25rem}
 .logs-toggle:hover{color:#a0aec0}
-.spinner{width:20px;height:20px;border:2.5px solid #2b4c7e;border-top-color:#63b3ed;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+.spinner{width:18px;height:18px;border:2px solid #2b4c7e;border-top-color:#63b3ed;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
-.card-status{display:flex;align-items:center;gap:.5rem;flex-shrink:0}
-.btn-stop{font-size:.62rem;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid #4a3060;background:#2d2040;color:#d6bcfa;cursor:pointer;transition:background .15s,opacity .15s;letter-spacing:.03em;white-space:nowrap}
+.card-status{display:flex;align-items:center;gap:.45rem;flex-shrink:0}
+.btn-stop{font-size:.6rem;font-weight:600;padding:3px 8px;border-radius:5px;border:1px solid #4a3060;background:#2d2040;color:#d6bcfa;cursor:pointer;transition:background .15s,opacity .15s;white-space:nowrap}
 .btn-stop:hover{background:#3d2a5a}
 .btn-stop:disabled{opacity:.45;cursor:not-allowed}
-/* ── Modal fullscreen de logs ── */
-.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;padding:0}
-.modal-backdrop.open{display:flex;align-items:stretch}
-.modal{background:#1a1f2e;display:flex;flex-direction:column;width:100%;height:100%;max-width:100%;overflow:hidden}
-@media(min-width:700px){
-  .modal-backdrop{padding:2rem;align-items:center}
-  .modal{border-radius:10px;max-width:860px;max-height:calc(100vh - 4rem);margin:auto}
+/* ── Vista lista en móvil ── */
+@media(max-width:600px){
+  main{padding:.5rem;grid-template-columns:1fr;gap:.35rem}
+  .card{padding:.65rem .8rem;border-radius:6px}
+  .card-body{display:none;margin-top:.55rem;padding-top:.55rem;border-top:1px solid #2d3748}
+  .card.expanded .card-body{display:block}
+  .card-header{cursor:pointer;-webkit-tap-highlight-color:transparent}
+  .ticket{font-size:.9rem}
+  .pagination{padding:.5rem .75rem;gap:.4rem}
 }
-.modal-header{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1.1rem;border-bottom:1px solid #2d3748;gap:.75rem;flex-shrink:0}
-.modal-title{font-size:.9rem;font-weight:700;color:#63b3ed}
-.modal-subtitle{font-size:.72rem;color:#718096;margin-top:.1rem}
-.modal-close{background:none;border:none;color:#718096;cursor:pointer;font-size:1.3rem;line-height:1;padding:.2rem .4rem;border-radius:4px;flex-shrink:0}
+/* ── Modal genérico ── */
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:100;padding:0}
+.modal-backdrop.open{display:flex;align-items:stretch}
+.modal{background:#1a1f2e;display:flex;flex-direction:column;width:100%;height:100%;overflow:hidden}
+@media(min-width:640px){
+  .modal-backdrop{padding:2rem;align-items:center}
+  .modal{border-radius:10px;max-width:900px;max-height:calc(100vh - 4rem);margin:auto}
+}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1rem;border-bottom:1px solid #2d3748;gap:.6rem;flex-shrink:0}
+.modal-title{font-size:.88rem;font-weight:700;color:#63b3ed}
+.modal-subtitle{font-size:.7rem;color:#718096;margin-top:.1rem}
+.modal-close{background:none;border:none;color:#718096;cursor:pointer;font-size:1.2rem;line-height:1;padding:.2rem .4rem;border-radius:4px;flex-shrink:0}
 .modal-close:hover{color:#e2e8f0;background:#2d3748}
-.modal-body{flex:1;overflow-y:auto;padding:.75rem 1rem;font-size:.72rem;font-family:monospace;color:#a0aec0;line-height:1.55}
-.modal-body .ts{color:#4a5568;user-select:none;margin-right:.4rem}
+.modal-body{flex:1;overflow-y:auto;padding:.7rem .9rem;font-size:.7rem;font-family:monospace;color:#a0aec0;line-height:1.55}
+.modal-body .ts{color:#4a5568;user-select:none;margin-right:.35rem}
+/* ── Panel "Ver logs" (todas las ejecuciones) ── */
+.all-logs-list{display:flex;flex-direction:column;gap:0}
+.alr{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;padding:.6rem .9rem;border-bottom:1px solid #1e2535;cursor:pointer;transition:background .12s}
+.alr:hover{background:#212840}
+.alr-info{}
+.alr-ticket{font-size:.82rem;font-weight:700;color:#63b3ed}
+.alr-meta{font-size:.68rem;color:#718096;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.15rem;align-items:center}
+.alr-actions{display:flex;gap:.35rem;flex-shrink:0;align-items:center}
+.btn-sm{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:5px;border:1px solid #2d3748;background:#232b3e;color:#a0aec0;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:.2rem;white-space:nowrap}
+.btn-sm:hover{background:#2d3748;color:#e2e8f0}
+.btn-sm.jira{border-color:#1e3a5f;background:#152840;color:#63b3ed}
+.btn-sm.gh{border-color:#1f3324;background:#152216;color:#48bb78}
+.alr-expand{background:none;border:none;color:#4a5568;cursor:pointer;font-size:.75rem;padding:.1rem .3rem;border-radius:3px;flex-shrink:0}
+.alr-expand:hover{color:#a0aec0;background:#2d3748}
 </style>
 </head>
 <body>
@@ -439,22 +477,51 @@ main{padding:1rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,m
   <div class="dot" id="dot"></div>
   <h1>Fleet Dashboard</h1>
   <span id="conn-label">Conectando...</span>
+  <button class="btn-hdr" onclick="openAllLogs()">📋 Ver logs</button>
 </header>
 <main id="grid">
   <div class="empty" id="empty">No hay jobs activos. Inicia uno con <code>POST /run</code>.</div>
 </main>
+<div class="pagination" id="pagination" style="display:none">
+  <label style="font-size:.7rem;color:#4a5568">Por página:</label>
+  <select id="per-page" onchange="setPerPage(+this.value)">
+    <option value="5">5</option>
+    <option value="10" selected>10</option>
+    <option value="25">25</option>
+  </select>
+  <div class="pg-spacer"></div>
+  <button class="pg-btn" id="prev-btn" onclick="goPage(-1)" disabled>‹</button>
+  <span id="page-info">1 / 1</span>
+  <button class="pg-btn" id="next-btn" onclick="goPage(1)" disabled>›</button>
+</div>
 
-<!-- Modal de logs fullscreen -->
-<div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">
+<!-- Modal logs de un job -->
+<div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event,'modal-backdrop')">
   <div class="modal">
     <div class="modal-header">
       <div>
         <div class="modal-title" id="modal-title">—</div>
         <div class="modal-subtitle" id="modal-subtitle"></div>
       </div>
-      <button class="modal-close" onclick="closeModal()" title="Cerrar">✕</button>
+      <button class="modal-close" onclick="closeLogModal()">✕</button>
     </div>
     <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<!-- Modal "Ver logs" (todas las ejecuciones) -->
+<div class="modal-backdrop" id="all-modal-backdrop" onclick="closeModalOnBackdrop(event,'all-modal-backdrop')">
+  <div class="modal" style="max-width:700px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Todas las ejecuciones</div>
+        <div class="modal-subtitle" id="all-modal-subtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeAllLogs()">✕</button>
+    </div>
+    <div class="modal-body" style="padding:0;font-family:system-ui,sans-serif">
+      <div class="all-logs-list" id="all-logs-list"></div>
+    </div>
   </div>
 </div>
 
@@ -463,17 +530,46 @@ const grid=document.getElementById('grid'),empty=document.getElementById('empty'
       dot=document.getElementById('dot'),lbl=document.getElementById('conn-label');
 const cards={};
 const pending={};
+const jobData={};
 const jobLogs={};
 const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
+const JIRA_BASE='https://veracta.atlassian.net/browse/';
+let currentPage=1,perPage=10;
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function elapsed(iso){
   const s=Math.floor((Date.now()-new Date(iso))/1000);
-  if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';
+  if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';
   return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';
 }
+function findPrUrl(job){
+  const text=(job.summary||'')+(jobLogs[job.job_id]||[]).join(' ');
+  const m=text.match(/https?:\/\/github\.com\/[^\s"'>]+\/pull\/\d+/);
+  return m?m[0]:null;
+}
 
-// ── Modal ──
+// ── Paginación ──
+function getSortedIds(){
+  return Object.keys(jobData).sort((a,b)=>new Date(jobData[b].started_at)-new Date(jobData[a].started_at));
+}
+function renderPage(){
+  const ids=getSortedIds();
+  const total=ids.length;
+  const totalPages=Math.max(1,Math.ceil(total/perPage));
+  if(currentPage>totalPages)currentPage=totalPages;
+  const start=(currentPage-1)*perPage,end=start+perPage;
+  const pageIds=new Set(ids.slice(start,end));
+  Object.keys(cards).forEach(jid=>{cards[jid].style.display=pageIds.has(jid)?'':'none';});
+  document.getElementById('page-info').textContent=`${currentPage} / ${totalPages}`;
+  document.getElementById('prev-btn').disabled=currentPage<=1;
+  document.getElementById('next-btn').disabled=currentPage>=totalPages;
+  document.getElementById('pagination').style.display=total>0?'flex':'none';
+  empty.style.display=total===0?'':'none';
+}
+function goPage(d){currentPage+=d;renderPage();}
+function setPerPage(v){perPage=v;currentPage=1;renderPage();}
+
+// ── Modal logs de un job ──
 let _modalJobId=null;
 function openLogs(jobId,ticketId){
   _modalJobId=jobId;
@@ -486,30 +582,87 @@ function openLogs(jobId,ticketId){
   document.getElementById('modal-backdrop').classList.add('open');
   document.body.style.overflow='hidden';
 }
-function closeModal(){
+function closeLogModal(){
   document.getElementById('modal-backdrop').classList.remove('open');
   document.body.style.overflow='';
   _modalJobId=null;
 }
-function closeModalOnBackdrop(e){if(e.target===document.getElementById('modal-backdrop'))closeModal();}
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+
+// ── Modal "Ver logs" ──
+function openAllLogs(){
+  const list=document.getElementById('all-logs-list');
+  list.innerHTML='';
+  const sorted=getSortedIds();
+  document.getElementById('all-modal-subtitle').textContent=`${sorted.length} ejecuciones`;
+  sorted.forEach(jid=>{
+    const job=jobData[jid];
+    if(!job)return;
+    const pr=findPrUrl(job);
+    const prBtn=pr?`<a class="btn-sm gh" href="${esc(pr)}" target="_blank" rel="noopener">⑁ PR</a>`:'';
+    const statusBadge=job.status==='running'
+      ?`<div class="spinner" style="width:14px;height:14px;border-width:2px"></div>`
+      :`<span class="badge badge-${job.status}">${job.status}</span>`;
+    const row=document.createElement('div');
+    row.className='alr';
+    row.innerHTML=`
+      <div class="alr-info">
+        <div class="alr-ticket">${esc(job.ticket_id)}</div>
+        <div class="alr-meta">
+          ${statusBadge}
+          <span class="phase ph-${job.phase}" style="display:inline-flex;align-items:center;gap:.25rem"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
+          <span>Ciclo ${job.iteration}</span>
+          <span class="elapsed" data-started="${job.started_at}">${elapsed(job.started_at)}</span>
+        </div>
+      </div>
+      <div class="alr-actions">
+        <a class="btn-sm jira" href="${JIRA_BASE}${esc(job.ticket_id)}" target="_blank" rel="noopener">Jira ↗</a>
+        ${prBtn}
+        <button class="btn-sm" onclick="openLogs('${jid}','${esc(job.ticket_id)}')">📄 Logs</button>
+      </div>`;
+    list.appendChild(row);
+  });
+  document.getElementById('all-modal-backdrop').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeAllLogs(){
+  document.getElementById('all-modal-backdrop').classList.remove('open');
+  if(!document.getElementById('modal-backdrop').classList.contains('open'))
+    document.body.style.overflow='';
+}
+function closeModalOnBackdrop(e,id){if(e.target===document.getElementById(id)){
+  document.getElementById(id).classList.remove('open');
+  if(!document.getElementById('modal-backdrop').classList.contains('open')&&
+     !document.getElementById('all-modal-backdrop').classList.contains('open'))
+    document.body.style.overflow='';
+}}
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    if(document.getElementById('modal-backdrop').classList.contains('open'))closeLogModal();
+    else if(document.getElementById('all-modal-backdrop').classList.contains('open'))closeAllLogs();
+  }
+});
 
 function makeLogLine(l){
   const div=document.createElement('div');
   const m=l.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);
-  if(m){
-    const ts=document.createElement('span');ts.className='ts';ts.textContent=m[1];
-    div.appendChild(ts);div.appendChild(document.createTextNode(m[2]));
-  } else {div.textContent=l;}
+  if(m){const ts=document.createElement('span');ts.className='ts';ts.textContent=m[1];div.appendChild(ts);div.appendChild(document.createTextNode(m[2]));}
+  else{div.textContent=l;}
   return div;
 }
 
+// ── Tarjeta ──
 function buildCard(job){
   const el=document.createElement('div');
   el.className='card'+(job.status==='running'?' running':'');
   el.id='card-'+job.job_id;
   el.innerHTML=cardInner(job);
-  el.querySelector('.logs-toggle').addEventListener('click',()=>openLogs(job.job_id,job.ticket_id));
+  // Móvil: tap en header expande/colapsa
+  el.querySelector('.card-header').addEventListener('click',()=>{
+    if(window.innerWidth<=600)el.classList.toggle('expanded');
+  });
+  el.querySelector('.logs-toggle').addEventListener('click',e=>{
+    e.stopPropagation();openLogs(job.job_id,job.ticket_id);
+  });
   return el;
 }
 
@@ -523,13 +676,13 @@ function cardInner(job){
     ?`<div class="spinner" id="badge-${job.job_id}"></div>`
     :`<span class="badge badge-${job.status}" id="badge-${job.job_id}">${job.status}</span>`;
   const stopBtn=isRunning
-    ?`<button class="btn-stop" id="stop-${job.job_id}" onclick="stopJob('${job.job_id}')">⏹ Detener</button>`
+    ?`<button class="btn-stop" id="stop-${job.job_id}" onclick="event.stopPropagation();stopJob('${job.job_id}')">⏹ Detener</button>`
     :'';
   return `<div class="card-header">
-    <div style="min-width:0">
+    <div class="card-info">
       <div class="ticket">${esc(job.ticket_id)}</div>
       <div class="meta">
-        <span class="phase ph-${job.phase}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
+        <span class="phase ph-${job.phase}" id="phase-${job.job_id}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
         <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
         <span><b id="files-${job.job_id}">${job.files_count}</b> arch.</span>
         <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${elapsed(job.started_at)}</span>
@@ -537,40 +690,49 @@ function cardInner(job){
     </div>
     <div class="card-status">${stopBtn}${statusEl}</div>
   </div>
-  <div class="logs-preview" id="logs-${job.job_id}">${preview}</div>
-  <div class="logs-toggle" id="toggle-${job.job_id}">▼ ver logs completos</div>`;
+  <div class="card-body">
+    <div class="logs-preview" id="logs-${job.job_id}">${preview}</div>
+    <div class="logs-toggle" id="toggle-${job.job_id}">▼ ver logs completos</div>
+  </div>`;
 }
 
 function showCard(job){
+  jobData[job.job_id]=job;
   jobLogs[job.job_id]=job.logs||[];
   let el=document.getElementById('card-'+job.job_id);
-  if(!el){el=buildCard(job);cards[job.job_id]=el;grid.insertBefore(el,grid.firstChild);empty.style.display='none';}
+  if(!el){el=buildCard(job);cards[job.job_id]=el;grid.insertBefore(el,grid.firstChild);}
+  renderPage();
   return el;
 }
 
 function patchCard(jobId,d){
   if(d.phase!==undefined){
-    const c=document.querySelector(`#card-${jobId} .phase`);
+    const c=document.getElementById('phase-'+jobId);
     if(c){c.className=`phase ph-${d.phase}`;c.innerHTML=`<span class="pd"></span>${PHASE_NAMES[d.phase]||d.phase}`;}
+    if(jobData[jobId])jobData[jobId].phase=d.phase;
   }
-  if(d.iteration!==undefined){const e=document.getElementById('iter-'+jobId);if(e)e.textContent=d.iteration;}
-  if(d.files_count!==undefined){const e=document.getElementById('files-'+jobId);if(e)e.textContent=d.files_count;}
+  if(d.iteration!==undefined){
+    const e=document.getElementById('iter-'+jobId);if(e)e.textContent=d.iteration;
+    if(jobData[jobId])jobData[jobId].iteration=d.iteration;
+  }
+  if(d.files_count!==undefined){
+    const e=document.getElementById('files-'+jobId);if(e)e.textContent=d.files_count;
+    if(jobData[jobId])jobData[jobId].files_count=d.files_count;
+  }
   if(d.status!==undefined){
     const b=document.getElementById('badge-'+jobId);
     if(b){
       if(d.status==='running'){b.className='spinner';b.textContent='';}
-      else{
-        b.className='badge badge-'+d.status;b.textContent=d.status;
-        const btn=document.getElementById('stop-'+jobId);if(btn)btn.remove();
-      }
+      else{b.className='badge badge-'+d.status;b.textContent=d.status;
+        const btn=document.getElementById('stop-'+jobId);if(btn)btn.remove();}
     }
     const c=document.getElementById('card-'+jobId);
     if(c)c.className='card'+(d.status==='running'?' running':'');
+    if(jobData[jobId])jobData[jobId].status=d.status;
   }
   if(d.log){
     if(!jobLogs[jobId])jobLogs[jobId]=[];
     jobLogs[jobId].push(d.log);
-    // Actualizar preview (últimas 3 líneas)
     const p=document.getElementById('logs-'+jobId);
     if(p){
       const recent=jobLogs[jobId].slice(-3);
@@ -579,7 +741,6 @@ function patchCard(jobId,d){
         return`<div>${m?`<span style="color:#4a5568">${esc(m[1])} </span>${esc(m[2])}`:esc(l)}</div>`;
       }).join('');
     }
-    // Si el modal está abierto para este job, agregar la línea en tiempo real
     if(_modalJobId===jobId){
       const body=document.getElementById('modal-body');
       const atBottom=body.scrollTop+body.clientHeight>=body.scrollHeight-30;
@@ -610,10 +771,9 @@ function connect(){
   es.onopen=()=>{dot.classList.add('on');lbl.textContent='Conectado';};
   es.onerror=()=>{dot.classList.remove('on');lbl.textContent='Reconectando...';};
   es.addEventListener('job_started',e=>{
-    const d=JSON.parse(e.data);
-    pending[d.job_id]=[];
+    const d=JSON.parse(e.data);pending[d.job_id]=[];
     fetch('/status/'+d.job_id).then(r=>r.json()).then(job=>{
-      const el=showCard(job);
+      showCard(job);
       (pending[d.job_id]||[]).forEach(u=>patchCard(u.job_id,u));
       delete pending[d.job_id];
     }).catch(()=>{});
