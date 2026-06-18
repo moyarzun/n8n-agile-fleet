@@ -1061,8 +1061,16 @@ function renderPage(){
   const totalPages=Math.max(1,Math.ceil(total/perPage));
   if(currentPage>totalPages)currentPage=totalPages;
   const start=(currentPage-1)*perPage,end=start+perPage;
-  const pageIds=new Set(ids.slice(start,end));
-  Object.keys(cards).forEach(jid=>{cards[jid].style.display=pageIds.has(jid)?'':'none';});
+  const pageIds=ids.slice(start,end);
+  const pageSet=new Set(pageIds);
+
+  // Ocultar tarjetas fuera de la página
+  Object.keys(cards).forEach(jid=>{cards[jid].style.display=pageSet.has(jid)?'':'none';});
+
+  // Reordenar DOM según el criterio de sort activo
+  pageIds.forEach(jid=>{if(cards[jid])grid.appendChild(cards[jid]);});
+  grid.appendChild(empty); // mantener "sin jobs" al final
+
   document.getElementById('page-info').textContent=`${currentPage} / ${totalPages}`;
   document.getElementById('prev-btn').disabled=currentPage<=1;
   document.getElementById('next-btn').disabled=currentPage>=totalPages;
