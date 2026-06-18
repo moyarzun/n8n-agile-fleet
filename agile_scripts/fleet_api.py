@@ -669,10 +669,13 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 /* ── Tarjeta ── */
 .card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.9rem;transition:border-color .2s}
 .card.running{border-color:#2b4c7e}
-.card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:.5rem}
+.card-header{display:flex;flex-direction:column;gap:.3rem}
+.card-top{display:flex;justify-content:space-between;align-items:center;gap:.5rem}
 .card-info{min-width:0;flex:1}
 .ticket{font-size:.98rem;font-weight:700;color:#63b3ed;word-break:break-word}
-.meta{display:flex;gap:.45rem;font-size:.71rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
+.card-summary{font-size:.72rem;color:#718096;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-summary:empty{display:none}
+.meta{display:flex;gap:.45rem;font-size:.71rem;color:#4a5568;flex-wrap:wrap;align-items:center}
 .card-body{margin-top:.7rem}
 .badge{font-size:.6rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .badge-running{background:#2b4c7e;color:#63b3ed}
@@ -1178,17 +1181,19 @@ function cardInner(job){
   const stopBtn=isRunning
     ?`<button class="btn-stop" id="stop-${job.job_id}" onclick="event.stopPropagation();stopJob('${job.job_id}')">⏹ Detener</button>`
     :'';
+  const summaryText=job.summary?job.summary.replace(/\*\*/g,'').replace(/#+\s/g,'').slice(0,200):'';
   return `<div class="card-header">
-    <div class="card-info">
+    <div class="card-top">
       <div class="ticket">${esc(job.ticket_id)}</div>
-      <div class="meta">
-        <span class="phase ph-${job.phase}" id="phase-${job.job_id}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
-        <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
-        <span><b id="files-${job.job_id}">${job.files_count}</b> arch.</span>
-        <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${elapsed(job.started_at)}</span>
-      </div>
+      <div class="card-status">${stopBtn}${statusEl}</div>
     </div>
-    <div class="card-status">${stopBtn}${statusEl}</div>
+    <div class="card-summary" id="summary-${job.job_id}">${esc(summaryText)}</div>
+    <div class="meta">
+      <span class="phase ph-${job.phase}" id="phase-${job.job_id}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
+      <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
+      <span><b id="files-${job.job_id}">${job.files_count}</b> arch.</span>
+      <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${elapsed(job.started_at)}</span>
+    </div>
   </div>
   <div class="card-body">
     <div class="logs-preview" id="logs-${job.job_id}">${preview}</div>
@@ -1218,6 +1223,11 @@ function patchCard(jobId,d){
   if(d.files_count!==undefined){
     const e=document.getElementById('files-'+jobId);if(e)e.textContent=d.files_count;
     if(jobData[jobId])jobData[jobId].files_count=d.files_count;
+  }
+  if(d.summary!==undefined){
+    const s=document.getElementById('summary-'+jobId);
+    if(s){const t=(d.summary||'').replace(/\*\*/g,'').replace(/#+\s/g,'').slice(0,200);s.textContent=t;}
+    if(jobData[jobId])jobData[jobId].summary=d.summary;
   }
   if(d.status!==undefined){
     const b=document.getElementById('badge-'+jobId);
@@ -1279,7 +1289,7 @@ function connect(){
     }).catch(()=>{});
   });
   es.addEventListener('job_update',e=>{const d=JSON.parse(e.data);if(!cards[d.job_id]){if(pending[d.job_id])pending[d.job_id].push(d);return;}patchCard(d.job_id,d);});
-  es.addEventListener('job_finished',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,{status:d.status});});
+  es.addEventListener('job_finished',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,{status:d.status,summary:d.summary});});
   es.addEventListener('token_update',e=>{
     const rows=JSON.parse(e.data);
     if(document.getElementById('view-metrics').classList.contains('active'))renderMetrics(rows);
