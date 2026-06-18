@@ -100,12 +100,38 @@ _OR_REVIEWER_CHAIN = [
 ]
 
 
+def _extract_token_usage(response: object, model_name: str) -> None:
+    """Emite una línea estructurada con el uso de tokens de la respuesta."""
+    try:
+        inp = out = total = 0
+        # LangChain >= 0.2: usage_metadata unificado
+        um = getattr(response, "usage_metadata", None)
+        if um:
+            inp   = um.get("input_tokens", 0) or 0
+            out   = um.get("output_tokens", 0) or 0
+            total = um.get("total_tokens", inp + out) or (inp + out)
+        else:
+            # Fallback: response_metadata.token_usage (OpenAI-compat)
+            rm = getattr(response, "response_metadata", {}) or {}
+            tu = rm.get("token_usage") or rm.get("usage") or {}
+            inp   = tu.get("prompt_tokens", 0) or 0
+            out   = tu.get("completion_tokens", 0) or 0
+            total = tu.get("total_tokens", inp + out) or (inp + out)
+        if inp or out:
+            _log(f"__TOKEN_USAGE__ {_json.dumps({'model': model_name, 'input': inp, 'output': out, 'total': total})}")
+    except Exception:
+        pass
+
+
 def _invoke_chain(primary, fallback_chain: list, messages: list) -> object:
     candidates = [primary] + fallback_chain
     last_exc = None
     for model in candidates:
         try:
-            return model.invoke(messages)
+            response = model.invoke(messages)
+            model_name = getattr(model, "model_name", str(model))
+            _extract_token_usage(response, model_name)
+            return response
         except Exception as exc:
             if _is_quota_error(exc) or "404" in str(exc):
                 name = getattr(model, "model_name", str(model))

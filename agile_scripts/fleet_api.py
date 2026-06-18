@@ -94,6 +94,16 @@ def _init_db() -> None:
                 logs        TEXT DEFAULT '[]'
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_metrics (
+                model            TEXT PRIMARY KEY,
+                input_tokens     INTEGER DEFAULT 0,
+                output_tokens    INTEGER DEFAULT 0,
+                total_tokens     INTEGER DEFAULT 0,
+                call_count       INTEGER DEFAULT 0,
+                last_updated     TEXT
+            )
+        """)
         conn.commit()
         conn.close()
 
@@ -114,6 +124,37 @@ def _persist_job(job: "JobState") -> None:
         ))
         conn.commit()
         conn.close()
+
+
+def _record_token_usage(model: str, inp: int, out: int, total: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _db_lock:
+        conn = _db_conn()
+        conn.execute("""
+            INSERT INTO token_metrics (model, input_tokens, output_tokens, total_tokens, call_count, last_updated)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(model) DO UPDATE SET
+                input_tokens  = input_tokens  + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                total_tokens  = total_tokens  + excluded.total_tokens,
+                call_count    = call_count    + 1,
+                last_updated  = excluded.last_updated
+        """, (model, inp, out, total, now))
+        conn.commit()
+        conn.close()
+
+
+def _get_token_metrics() -> list:
+    try:
+        with _db_lock:
+            conn = _db_conn()
+            rows = conn.execute(
+                "SELECT * FROM token_metrics ORDER BY total_tokens DESC"
+            ).fetchall()
+            conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def _load_jobs_from_db() -> Dict[str, "JobState"]:
@@ -236,6 +277,15 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
 
     # Conectar callback de logging verboso al SSE + job.logs
     def _progress_log(message: str) -> None:
+        # Capturar métricas de tokens (no se muestran en logs de UI)
+        if message.startswith("__TOKEN_USAGE__ "):
+            try:
+                tu = json.loads(message[len("__TOKEN_USAGE__ "):])
+                _record_token_usage(tu["model"], tu.get("input", 0), tu.get("output", 0), tu.get("total", 0))
+                _emit("token_update", _get_token_metrics())
+            except Exception:
+                pass
+            return
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         line = f"[{ts}] {message}"
         job.logs.append(line)
@@ -417,6 +467,11 @@ async def stop_job(job_id: str):
     return {"job_id": job_id, "stopping": True}
 
 
+@app.get("/metrics")
+def get_metrics() -> list:
+    return _get_token_metrics()
+
+
 @app.get("/status")
 def get_all_status() -> dict:
     return {jid: job.to_dict() for jid, job in _jobs.items()}
@@ -481,6 +536,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
 header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:.65rem 1.1rem;display:flex;align-items:center;gap:.6rem;position:sticky;top:0;z-index:10}
 header h1{font-size:.95rem;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tabs{display:flex;gap:0;border-bottom:1px solid #2d3748;background:#131823;padding:0 1rem}
+.tab-btn{font-size:.75rem;font-weight:600;padding:.55rem .9rem;border:none;background:none;color:#718096;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .15s,border-color .15s}
+.tab-btn:hover{color:#a0aec0}
+.tab-btn.active{color:#63b3ed;border-bottom-color:#63b3ed}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
 .dot{width:8px;height:8px;border-radius:50%;background:#fc8181;transition:background .3s;flex-shrink:0}
 .dot.on{background:#48bb78;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
@@ -576,6 +637,37 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 .btn-sm.gh{border-color:#1f3324;background:#152216;color:#48bb78}
 .alr-expand{background:none;border:none;color:#4a5568;cursor:pointer;font-size:.75rem;padding:.1rem .3rem;border-radius:3px;flex-shrink:0}
 .alr-expand:hover{color:#a0aec0;background:#2d3748}
+/* ── Métricas ── */
+#view-metrics{padding:1rem}
+.metrics-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.9rem;flex-wrap:wrap;gap:.5rem}
+.metrics-header h2{font-size:.88rem;font-weight:700;color:#e2e8f0}
+.metrics-updated{font-size:.68rem;color:#4a5568}
+.metrics-table{width:100%;border-collapse:collapse;font-size:.78rem}
+.metrics-table th{text-align:left;padding:.5rem .75rem;font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#4a5568;border-bottom:2px solid #2d3748;white-space:nowrap}
+.metrics-table th.num{text-align:right}
+.metrics-table td{padding:.55rem .75rem;border-bottom:1px solid #1e2535;color:#a0aec0;vertical-align:middle}
+.metrics-table td.num{text-align:right;font-family:monospace;color:#e2e8f0}
+.metrics-table tr:hover td{background:#1e2535}
+.model-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.68rem;font-weight:700;white-space:nowrap}
+.model-minimax{background:#1a2e4a;color:#63b3ed;border:1px solid #1e3a5f}
+.model-qwen{background:#1a2e1a;color:#68d391;border:1px solid #1a3a1a}
+.model-nvidia{background:#1a2a1a;color:#48bb78;border:1px solid #1a3a1a}
+.model-llama{background:#2a1a2e;color:#b794f4;border:1px solid #3a1a4a}
+.model-other{background:#2d3748;color:#a0aec0;border:1px solid #4a5568}
+.bar-wrap{display:flex;align-items:center;gap:.5rem}
+.bar-bg{flex:1;height:6px;background:#1e2535;border-radius:3px;min-width:60px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;transition:width .4s ease}
+.bar-input{background:#3b5998}
+.bar-output{background:#2d6a4f}
+.metrics-empty{color:#4a5568;font-size:.82rem;text-align:center;padding:3rem 1rem}
+.metrics-totals{margin-top:1rem;display:flex;gap:1rem;flex-wrap:wrap}
+.metric-card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.75rem 1rem;flex:1;min-width:140px}
+.metric-card .mc-val{font-size:1.3rem;font-weight:700;color:#63b3ed;font-family:monospace}
+.metric-card .mc-label{font-size:.65rem;color:#4a5568;margin-top:.2rem;text-transform:uppercase;letter-spacing:.05em}
+@media(max-width:600px){
+  .metrics-table th:nth-child(4),.metrics-table td:nth-child(4){display:none}
+  #view-metrics{padding:.6rem}
+}
 </style>
 </head>
 <body>
@@ -585,6 +677,11 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
   <span id="conn-label">Conectando...</span>
   <button class="btn-hdr" onclick="openAllLogs()">📋 Ver logs</button>
 </header>
+<div class="tabs">
+  <button class="tab-btn active" id="tab-jobs" onclick="switchTab('jobs')">Ejecuciones</button>
+  <button class="tab-btn" id="tab-metrics" onclick="switchTab('metrics')">Métricas de tokens</button>
+</div>
+<div id="view-jobs" class="tab-panel active">
 <div class="sort-bar" id="sort-bar">
   <span class="sort-label">Ordenar:</span>
   <button class="sort-btn" id="sb-ticket_id" onclick="setSort('ticket_id')">Nombre <span class="sort-arrow" id="sa-ticket_id"></span></button>
@@ -596,6 +693,29 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 <main id="grid">
   <div class="empty" id="empty">No hay jobs activos. Inicia uno con <code>POST /run</code>.</div>
 </main>
+</div><!-- /view-jobs -->
+<div id="view-metrics" class="tab-panel">
+  <div id="view-metrics-inner">
+    <div class="metrics-header">
+      <h2>Uso de tokens por modelo</h2>
+      <span class="metrics-updated" id="metrics-updated"></span>
+    </div>
+    <div class="metrics-totals" id="metrics-totals"></div>
+    <div style="margin-top:1rem;overflow-x:auto">
+      <table class="metrics-table" id="metrics-table">
+        <thead><tr>
+          <th>Modelo</th>
+          <th class="num">Llamadas</th>
+          <th class="num">Tokens entrada</th>
+          <th class="num">Tokens salida</th>
+          <th class="num">Total tokens</th>
+          <th style="min-width:120px">Distribución</th>
+        </tr></thead>
+        <tbody id="metrics-tbody"><tr><td colspan="6" class="metrics-empty">Cargando métricas…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 <div class="pagination" id="pagination" style="display:none">
   <label style="font-size:.7rem;color:#4a5568">Por página:</label>
   <select id="per-page" onchange="setPerPage(+this.value)">
@@ -649,6 +769,70 @@ const jobLogs={};
 const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
 const JIRA_BASE='https://veracta.atlassian.net/browse/';
 let currentPage=1,perPage=10;
+
+// ── Tabs ──
+function switchTab(name){
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.getElementById('view-'+name).classList.add('active');
+  if(name==='metrics')loadMetrics();
+}
+
+// ── Métricas ──
+function modelClass(m){
+  const l=m.toLowerCase();
+  if(l.includes('minimax'))return'model-minimax';
+  if(l.includes('qwen'))return'model-qwen';
+  if(l.includes('nvidia')||l.includes('nemotron'))return'model-nvidia';
+  if(l.includes('llama'))return'model-llama';
+  return'model-other';
+}
+function fmt(n){return Number(n||0).toLocaleString('es-CL');}
+
+function renderMetrics(rows){
+  const tbody=document.getElementById('metrics-tbody');
+  const totals=document.getElementById('metrics-totals');
+  document.getElementById('metrics-updated').textContent='Actualizado: '+new Date().toLocaleTimeString('es-CL');
+  if(!rows||!rows.length){
+    tbody.innerHTML='<tr><td colspan="6" class="metrics-empty">Sin datos aún. Los tokens se registran cuando corren jobs.</td></tr>';
+    totals.innerHTML='';return;
+  }
+  const maxTotal=Math.max(...rows.map(r=>r.total_tokens||0),1);
+  const sumIn=rows.reduce((a,r)=>a+(r.input_tokens||0),0);
+  const sumOut=rows.reduce((a,r)=>a+(r.output_tokens||0),0);
+  const sumTot=rows.reduce((a,r)=>a+(r.total_tokens||0),0);
+  const sumCalls=rows.reduce((a,r)=>a+(r.call_count||0),0);
+  totals.innerHTML=`
+    <div class="metric-card"><div class="mc-val">${fmt(sumTot)}</div><div class="mc-label">Tokens totales</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sumIn)}</div><div class="mc-label">Tokens entrada</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sumOut)}</div><div class="mc-label">Tokens salida</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sumCalls)}</div><div class="mc-label">Llamadas LLM</div></div>`;
+  tbody.innerHTML=rows.map(r=>{
+    const pctIn =Math.round(((r.input_tokens||0)/maxTotal)*100);
+    const pctOut=Math.round(((r.output_tokens||0)/maxTotal)*100);
+    const shortName=r.model.split('/').pop();
+    return`<tr>
+      <td><span class="model-pill ${modelClass(r.model)}" title="${esc(r.model)}">${esc(shortName)}</span></td>
+      <td class="num">${fmt(r.call_count)}</td>
+      <td class="num">${fmt(r.input_tokens)}</td>
+      <td class="num">${fmt(r.output_tokens)}</td>
+      <td class="num">${fmt(r.total_tokens)}</td>
+      <td>
+        <div class="bar-wrap">
+          <div class="bar-bg"><div class="bar-fill bar-input" style="width:${pctIn}%"></div></div>
+        </div>
+        <div class="bar-wrap" style="margin-top:3px">
+          <div class="bar-bg"><div class="bar-fill bar-output" style="width:${pctOut}%"></div></div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function loadMetrics(){
+  fetch('/metrics').then(r=>r.json()).then(renderMetrics).catch(()=>{});
+}
 let sortField='started_at',sortDir='desc';
 const STATUS_ORDER={running:0,queued:1,approved:2,rejected:3,error:4,stopped:5};
 
@@ -918,6 +1102,10 @@ function connect(){
   });
   es.addEventListener('job_update',e=>{const d=JSON.parse(e.data);if(!cards[d.job_id]){if(pending[d.job_id])pending[d.job_id].push(d);return;}patchCard(d.job_id,d);});
   es.addEventListener('job_finished',e=>{const d=JSON.parse(e.data);patchCard(d.job_id,{status:d.status});});
+  es.addEventListener('token_update',e=>{
+    const rows=JSON.parse(e.data);
+    if(document.getElementById('view-metrics').classList.contains('active'))renderMetrics(rows);
+  });
 }
 connect();
 </script>
