@@ -258,6 +258,13 @@ def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
             content = content.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "")
         full_path = os.path.join(workspace, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        # Eliminar antes de escribir para evitar deadlock VirtioFS (Errno 35):
+        # los archivos existentes en volúmenes macOS heredan xattrs que bloquean escritura.
+        if os.path.exists(full_path):
+            try:
+                os.unlink(full_path)
+            except OSError:
+                pass
         with open(full_path, "w") as fh:
             fh.write(content)
         applied.append(rel_path)
