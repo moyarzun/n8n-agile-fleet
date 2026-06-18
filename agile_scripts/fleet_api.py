@@ -480,6 +480,13 @@ header h1{font-size:.95rem;font-weight:600;flex:1;min-width:0;white-space:nowrap
 main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr))}
 .empty{text-align:center;color:#4a5568;margin:4rem auto;grid-column:1/-1;font-size:.9rem}
 .empty code{background:#1a1f2e;padding:2px 6px;border-radius:4px;font-size:.85rem}
+/* ── Barra de ordenamiento ── */
+.sort-bar{display:flex;align-items:center;gap:.4rem;padding:.5rem 1rem;background:#131823;border-bottom:1px solid #1e2535;flex-wrap:wrap}
+.sort-label{font-size:.68rem;color:#4a5568;white-space:nowrap;margin-right:.1rem}
+.sort-btn{font-size:.68rem;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid #2d3748;background:#1a1f2e;color:#718096;cursor:pointer;white-space:nowrap;transition:background .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;gap:.25rem}
+.sort-btn:hover{background:#232b3e;color:#a0aec0}
+.sort-btn.active{background:#1e3050;border-color:#3b5998;color:#63b3ed}
+.sort-arrow{font-size:.6rem;opacity:.8}
 /* ── Paginación ── */
 .pagination{display:flex;align-items:center;gap:.5rem;padding:.6rem 1rem;background:#1a1f2e;border-top:1px solid #2d3748;position:sticky;bottom:0;z-index:9}
 .pagination select{background:#0f1117;color:#a0aec0;border:1px solid #2d3748;border-radius:5px;padding:3px 6px;font-size:.72rem;cursor:pointer}
@@ -566,6 +573,14 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
   <span id="conn-label">Conectando...</span>
   <button class="btn-hdr" onclick="openAllLogs()">📋 Ver logs</button>
 </header>
+<div class="sort-bar" id="sort-bar">
+  <span class="sort-label">Ordenar:</span>
+  <button class="sort-btn" id="sb-ticket_id" onclick="setSort('ticket_id')">Nombre <span class="sort-arrow" id="sa-ticket_id"></span></button>
+  <button class="sort-btn" id="sb-status" onclick="setSort('status')">Estado <span class="sort-arrow" id="sa-status"></span></button>
+  <button class="sort-btn active" id="sb-started_at" onclick="setSort('started_at')">Edad <span class="sort-arrow" id="sa-started_at">↓</span></button>
+  <button class="sort-btn" id="sb-iteration" onclick="setSort('iteration')">Ciclo <span class="sort-arrow" id="sa-iteration"></span></button>
+  <button class="sort-btn" id="sb-files_count" onclick="setSort('files_count')">Archivos <span class="sort-arrow" id="sa-files_count"></span></button>
+</div>
 <main id="grid">
   <div class="empty" id="empty">No hay jobs activos. Inicia uno con <code>POST /run</code>.</div>
 </main>
@@ -622,6 +637,8 @@ const jobLogs={};
 const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
 const JIRA_BASE='https://veracta.atlassian.net/browse/';
 let currentPage=1,perPage=10;
+let sortField='started_at',sortDir='desc';
+const STATUS_ORDER={running:0,queued:1,approved:2,rejected:3,error:4,stopped:5};
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function elapsed(iso){
@@ -635,9 +652,31 @@ function findPrUrl(job){
   return m?m[0]:null;
 }
 
-// ── Paginación ──
+// ── Ordenamiento ──
+function setSort(field){
+  if(sortField===field){sortDir=sortDir==='asc'?'desc':'asc';}
+  else{sortField=field;sortDir=field==='started_at'?'desc':'asc';}
+  document.querySelectorAll('.sort-btn').forEach(b=>b.classList.remove('active'));
+  const btn=document.getElementById('sb-'+field);if(btn)btn.classList.add('active');
+  ['ticket_id','status','started_at','iteration','files_count'].forEach(f=>{
+    const sa=document.getElementById('sa-'+f);if(sa)sa.textContent=f===sortField?(sortDir==='asc'?'↑':'↓'):'';
+  });
+  currentPage=1;renderPage();
+}
+
 function getSortedIds(){
-  return Object.keys(jobData).sort((a,b)=>new Date(jobData[b].started_at)-new Date(jobData[a].started_at));
+  return Object.keys(jobData).sort((a,b)=>{
+    const ja=jobData[a],jb=jobData[b];
+    let va,vb;
+    if(sortField==='status'){va=STATUS_ORDER[ja.status]??9;vb=STATUS_ORDER[jb.status]??9;}
+    else if(sortField==='started_at'){va=new Date(ja.started_at||0);vb=new Date(jb.started_at||0);}
+    else if(sortField==='iteration'){va=ja.iteration||0;vb=jb.iteration||0;}
+    else if(sortField==='files_count'){va=ja.files_count||0;vb=jb.files_count||0;}
+    else{va=String(ja[sortField]||'').toLowerCase();vb=String(jb[sortField]||'').toLowerCase();}
+    if(va<vb)return sortDir==='asc'?-1:1;
+    if(va>vb)return sortDir==='asc'?1:-1;
+    return 0;
+  });
 }
 function renderPage(){
   const ids=getSortedIds();
