@@ -526,7 +526,7 @@ def finalize_and_update_jira(state: FleetState) -> dict:
             to_value    = transition.get("to", "")
             target_name = (to_value if isinstance(to_value, str) else to_value.get("name", "")).lower()
             if any(kw in target_name for kw in target_keywords):
-                jira_client.transition_issue(ticket_id, transition["id"])
+                jira_client.set_issue_status_by_transition_id(ticket_id, transition["id"])
                 status_parts.append(f"transicionado a '{target_name}'")
                 _log(f"[jira_updater] Ticket transicionado a '{target_name}' ✓")
                 break
@@ -565,7 +565,7 @@ def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied
             to_value = transition.get("to", "")
             name = (to_value if isinstance(to_value, str) else to_value.get("name", "")).lower()
             if "bloquead" in name or "blocked" in name:
-                jira_client.transition_issue(ticket_id, transition["id"])
+                jira_client.set_issue_status_by_transition_id(ticket_id, transition["id"])
                 logger.info("stop_gracefully: %s → Bloqueado", ticket_id)
                 return
         logger.warning("stop_gracefully: no se encontró transición a Bloqueado en %s", ticket_id)
