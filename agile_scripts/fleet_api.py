@@ -125,6 +125,7 @@ def _load_jobs_from_db() -> Dict[str, "JobState"]:
                 "SELECT * FROM jobs ORDER BY started_at DESC LIMIT 1000"
             ).fetchall()
             conn.close()
+        interrupted = []
         for row in rows:
             j = JobState(job_id=row["job_id"], ticket_id=row["ticket_id"])
             j.status      = row["status"]
@@ -135,7 +136,17 @@ def _load_jobs_from_db() -> Dict[str, "JobState"]:
             j.started_at  = row["started_at"]
             j.finished_at = row["finished_at"]
             j.logs        = json.loads(row["logs"] or "[]")
+            # Jobs activos sin worker real → marcar como interrumpidos
+            if j.status in ("queued", "running"):
+                j.status = "interrupted"
+                j.finished_at = datetime.now(timezone.utc).isoformat()
+                j.summary = "Interrumpido por reinicio del contenedor."
+                interrupted.append(j)
             jobs[j.job_id] = j
+        if interrupted:
+            for j in interrupted:
+                _persist_job(j)
+            print(f"[fleet] {len(interrupted)} jobs marcados como 'interrupted' por reinicio.")
     except Exception as exc:
         print(f"[fleet] Aviso: no se cargaron jobs desde DB: {exc}")
     return jobs
@@ -511,6 +522,7 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 .badge-error{background:#3a2a1c;color:#ed8936}
 .badge-queued{background:#2d3748;color:#a0aec0}
 .badge-stopped{background:#2d2a3a;color:#b794f4}
+.badge-interrupted{background:#2a2a1c;color:#ecc94b}
 .phase{display:flex;align-items:center;gap:.3rem}
 .pd{width:6px;height:6px;border-radius:50%;background:#718096;flex-shrink:0}
 .ph-dynamic_developer .pd{background:#63b3ed}
