@@ -381,41 +381,57 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:1rem 2rem;display:flex;align-items:center;gap:.75rem}
-header h1{font-size:1.1rem;font-weight:600}
-.dot{width:8px;height:8px;border-radius:50%;background:#fc8181;transition:background .3s}
+header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:.75rem 1.25rem;display:flex;align-items:center;gap:.75rem;position:sticky;top:0;z-index:10}
+header h1{font-size:1rem;font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;background:#fc8181;transition:background .3s;flex-shrink:0}
 .dot.on{background:#48bb78;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #conn-label{font-size:.75rem;color:#4a5568;margin-left:.25rem}
-main{padding:1.5rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(420px,1fr))}
+main{padding:1rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr))}
+@media(max-width:480px){main{padding:.75rem .5rem;gap:.75rem}}
 .empty{text-align:center;color:#4a5568;margin:4rem auto;grid-column:1/-1;font-size:.9rem}
 .empty code{background:#1a1f2e;padding:2px 6px;border-radius:4px;font-size:.85rem}
-.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:1.25rem;transition:border-color .2s}
+.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:1rem;transition:border-color .2s}
 .card.running{border-color:#2b4c7e}
-.card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.75rem}
-.ticket{font-size:1.05rem;font-weight:700;color:#63b3ed}
-.meta{display:flex;gap:.75rem;font-size:.75rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
-.badge{font-size:.65rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em}
+.card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.75rem;gap:.5rem}
+.ticket{font-size:1rem;font-weight:700;color:#63b3ed;word-break:break-word}
+.meta{display:flex;gap:.5rem;font-size:.72rem;color:#718096;margin-top:.3rem;flex-wrap:wrap;align-items:center}
+.badge{font-size:.62rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .badge-running{background:#2b4c7e;color:#63b3ed}
 .badge-approved{background:#1c3a2e;color:#48bb78}
 .badge-rejected{background:#3a1c1c;color:#fc8181}
 .badge-error{background:#3a2a1c;color:#ed8936}
 .badge-queued{background:#2d3748;color:#a0aec0}
+.badge-stopped{background:#2d2a3a;color:#b794f4}
 .phase{display:flex;align-items:center;gap:.3rem}
-.pd{width:6px;height:6px;border-radius:50%;background:#718096}
+.pd{width:6px;height:6px;border-radius:50%;background:#718096;flex-shrink:0}
 .ph-dynamic_developer .pd{background:#63b3ed}
 .ph-quality_reviewer .pd{background:#ecc94b}
 .ph-jira_updater .pd{background:#48bb78}
-.logs{background:#0f1117;border-radius:4px;padding:.6rem .75rem;font-size:.7rem;font-family:monospace;max-height:100px;overflow-y:auto;color:#a0aec0;cursor:pointer;transition:max-height .2s}
-.logs.x{max-height:260px}
-.logs-toggle{font-size:.68rem;color:#4a5568;margin-top:.3rem;cursor:pointer;user-select:none}
+.logs-preview{background:#0f1117;border-radius:4px;padding:.5rem .6rem;font-size:.68rem;font-family:monospace;max-height:72px;overflow:hidden;color:#a0aec0;line-height:1.4}
+.logs-toggle{font-size:.68rem;color:#4a5568;margin-top:.35rem;cursor:pointer;user-select:none;display:flex;align-items:center;gap:.3rem;width:fit-content}
+.logs-toggle:hover{color:#a0aec0}
 .spinner{width:20px;height:20px;border:2.5px solid #2b4c7e;border-top-color:#63b3ed;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
-.badge-stopped{background:#2d2a3a;color:#b794f4}
-.card-status{display:flex;align-items:center;gap:.5rem}
-.btn-stop{font-size:.65rem;font-weight:600;padding:3px 10px;border-radius:6px;border:1px solid #4a3060;background:#2d2040;color:#d6bcfa;cursor:pointer;transition:background .15s,opacity .15s;letter-spacing:.03em}
+.card-status{display:flex;align-items:center;gap:.5rem;flex-shrink:0}
+.btn-stop{font-size:.62rem;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid #4a3060;background:#2d2040;color:#d6bcfa;cursor:pointer;transition:background .15s,opacity .15s;letter-spacing:.03em;white-space:nowrap}
 .btn-stop:hover{background:#3d2a5a}
 .btn-stop:disabled{opacity:.45;cursor:not-allowed}
+/* ── Modal fullscreen de logs ── */
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;padding:0}
+.modal-backdrop.open{display:flex;align-items:stretch}
+.modal{background:#1a1f2e;display:flex;flex-direction:column;width:100%;height:100%;max-width:100%;overflow:hidden}
+@media(min-width:700px){
+  .modal-backdrop{padding:2rem;align-items:center}
+  .modal{border-radius:10px;max-width:860px;max-height:calc(100vh - 4rem);margin:auto}
+}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1.1rem;border-bottom:1px solid #2d3748;gap:.75rem;flex-shrink:0}
+.modal-title{font-size:.9rem;font-weight:700;color:#63b3ed}
+.modal-subtitle{font-size:.72rem;color:#718096;margin-top:.1rem}
+.modal-close{background:none;border:none;color:#718096;cursor:pointer;font-size:1.3rem;line-height:1;padding:.2rem .4rem;border-radius:4px;flex-shrink:0}
+.modal-close:hover{color:#e2e8f0;background:#2d3748}
+.modal-body{flex:1;overflow-y:auto;padding:.75rem 1rem;font-size:.72rem;font-family:monospace;color:#a0aec0;line-height:1.55}
+.modal-body .ts{color:#4a5568;user-select:none;margin-right:.4rem}
 </style>
 </head>
 <body>
@@ -427,11 +443,27 @@ main{padding:1.5rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fill
 <main id="grid">
   <div class="empty" id="empty">No hay jobs activos. Inicia uno con <code>POST /run</code>.</div>
 </main>
+
+<!-- Modal de logs fullscreen -->
+<div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="modal-title">—</div>
+        <div class="modal-subtitle" id="modal-subtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeModal()" title="Cerrar">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const grid=document.getElementById('grid'),empty=document.getElementById('empty'),
       dot=document.getElementById('dot'),lbl=document.getElementById('conn-label');
 const cards={};
 const pending={};
+const jobLogs={};
 const PHASE_NAMES={context_ingestion:'Contexto',dynamic_developer:'Desarrollando',quality_reviewer:'Revisando',jira_updater:'Actualizando Jira'};
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -441,24 +473,50 @@ function elapsed(iso){
   return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';
 }
 
+// ── Modal ──
+let _modalJobId=null;
+function openLogs(jobId,ticketId){
+  _modalJobId=jobId;
+  document.getElementById('modal-title').textContent=ticketId;
+  document.getElementById('modal-subtitle').textContent='Job '+jobId.slice(0,8)+'…';
+  const body=document.getElementById('modal-body');
+  body.innerHTML='';
+  (jobLogs[jobId]||[]).forEach(l=>body.appendChild(makeLogLine(l)));
+  body.scrollTop=body.scrollHeight;
+  document.getElementById('modal-backdrop').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeModal(){
+  document.getElementById('modal-backdrop').classList.remove('open');
+  document.body.style.overflow='';
+  _modalJobId=null;
+}
+function closeModalOnBackdrop(e){if(e.target===document.getElementById('modal-backdrop'))closeModal();}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+
+function makeLogLine(l){
+  const div=document.createElement('div');
+  const m=l.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);
+  if(m){
+    const ts=document.createElement('span');ts.className='ts';ts.textContent=m[1];
+    div.appendChild(ts);div.appendChild(document.createTextNode(m[2]));
+  } else {div.textContent=l;}
+  return div;
+}
+
 function buildCard(job){
   const el=document.createElement('div');
   el.className='card'+(job.status==='running'?' running':'');
   el.id='card-'+job.job_id;
   el.innerHTML=cardInner(job);
-  el.querySelector('.logs').addEventListener('click',()=>{
-    const l=el.querySelector('.logs'),t=el.querySelector('.logs-toggle');
-    l.classList.toggle('x');
-    t.textContent=l.classList.contains('x')?'▲ colapsar':'▼ expandir';
-  });
+  el.querySelector('.logs-toggle').addEventListener('click',()=>openLogs(job.job_id,job.ticket_id));
   return el;
 }
 
 function cardInner(job){
-  const logLines=(job.logs||[]).slice(-10).map(l=>{
+  const preview=(job.logs||[]).slice(-3).map(l=>{
     const m=l.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);
-    if(m)return`<div><span style="color:#4a5568;user-select:none">${esc(m[1])} </span>${esc(m[2])}</div>`;
-    return`<div>${esc(l)}</div>`;
+    return`<div>${m?`<span style="color:#4a5568">${esc(m[1])} </span>${esc(m[2])}`:esc(l)}</div>`;
   }).join('')||'<div style="color:#4a5568">Sin logs aún.</div>';
   const isRunning=job.status==='running';
   const statusEl=isRunning
@@ -468,22 +526,23 @@ function cardInner(job){
     ?`<button class="btn-stop" id="stop-${job.job_id}" onclick="stopJob('${job.job_id}')">⏹ Detener</button>`
     :'';
   return `<div class="card-header">
-    <div>
+    <div style="min-width:0">
       <div class="ticket">${esc(job.ticket_id)}</div>
       <div class="meta">
         <span class="phase ph-${job.phase}"><span class="pd"></span>${PHASE_NAMES[job.phase]||job.phase||'—'}</span>
         <span>Ciclo <b id="iter-${job.job_id}">${job.iteration}</b></span>
-        <span><b id="files-${job.job_id}">${job.files_count}</b> archivos</span>
+        <span><b id="files-${job.job_id}">${job.files_count}</b> arch.</span>
         <span class="elapsed" data-started="${job.started_at}" id="elapsed-${job.job_id}">${elapsed(job.started_at)}</span>
       </div>
     </div>
     <div class="card-status">${stopBtn}${statusEl}</div>
   </div>
-  <div class="logs" id="logs-${job.job_id}">${logLines}</div>
-  <div class="logs-toggle">▼ expandir</div>`;
+  <div class="logs-preview" id="logs-${job.job_id}">${preview}</div>
+  <div class="logs-toggle" id="toggle-${job.job_id}">▼ ver logs completos</div>`;
 }
 
 function showCard(job){
+  jobLogs[job.job_id]=job.logs||[];
   let el=document.getElementById('card-'+job.job_id);
   if(!el){el=buildCard(job);cards[job.job_id]=el;grid.insertBefore(el,grid.firstChild);empty.style.display='none';}
   return el;
@@ -499,24 +558,34 @@ function patchCard(jobId,d){
   if(d.status!==undefined){
     const b=document.getElementById('badge-'+jobId);
     if(b){
-      if(d.status==='running'){
-        b.className='spinner';
-        b.textContent='';
-      } else {
-        b.className='badge badge-'+d.status;
-        b.textContent=d.status;
-        // Eliminar botón Detener cuando el job ya no está running
-        const btn=document.getElementById('stop-'+jobId);
-        if(btn) btn.remove();
+      if(d.status==='running'){b.className='spinner';b.textContent='';}
+      else{
+        b.className='badge badge-'+d.status;b.textContent=d.status;
+        const btn=document.getElementById('stop-'+jobId);if(btn)btn.remove();
       }
     }
     const c=document.getElementById('card-'+jobId);
     if(c)c.className='card'+(d.status==='running'?' running':'');
   }
   if(d.log){
-    const l=document.getElementById('logs-'+jobId);
-    if(l){const div=document.createElement('div');const m=d.log.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);div.innerHTML=m?`<span style="color:#4a5568;user-select:none">${esc(m[1])} </span>${esc(m[2])}`:esc(d.log);l.appendChild(div);
-      if(l.scrollTop+l.clientHeight>=l.scrollHeight-20)l.scrollTop=l.scrollHeight;}
+    if(!jobLogs[jobId])jobLogs[jobId]=[];
+    jobLogs[jobId].push(d.log);
+    // Actualizar preview (últimas 3 líneas)
+    const p=document.getElementById('logs-'+jobId);
+    if(p){
+      const recent=jobLogs[jobId].slice(-3);
+      p.innerHTML=recent.map(l=>{
+        const m=l.match(/^(\[\d{2}:\d{2}:\d{2}\])\s(.+)$/);
+        return`<div>${m?`<span style="color:#4a5568">${esc(m[1])} </span>${esc(m[2])}`:esc(l)}</div>`;
+      }).join('');
+    }
+    // Si el modal está abierto para este job, agregar la línea en tiempo real
+    if(_modalJobId===jobId){
+      const body=document.getElementById('modal-body');
+      const atBottom=body.scrollTop+body.clientHeight>=body.scrollHeight-30;
+      body.appendChild(makeLogLine(d.log));
+      if(atBottom)body.scrollTop=body.scrollHeight;
+    }
   }
 }
 
