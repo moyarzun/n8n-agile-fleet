@@ -104,6 +104,18 @@ def _init_db() -> None:
                 last_updated     TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                model         TEXT NOT NULL,
+                input_tokens  INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens  INTEGER DEFAULT 0,
+                job_id        TEXT DEFAULT '',
+                recorded_at   TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_token_events_recorded ON token_events(recorded_at)")
         conn.commit()
         conn.close()
 
@@ -126,10 +138,14 @@ def _persist_job(job: "JobState") -> None:
         conn.close()
 
 
-def _record_token_usage(model: str, inp: int, out: int, total: int) -> None:
+def _record_token_usage(model: str, inp: int, out: int, total: int, job_id: str = "") -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _db_lock:
         conn = _db_conn()
+        conn.execute("""
+            INSERT INTO token_events (model, input_tokens, output_tokens, total_tokens, job_id, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (model, inp, out, total, job_id, now))
         conn.execute("""
             INSERT INTO token_metrics (model, input_tokens, output_tokens, total_tokens, call_count, last_updated)
             VALUES (?, ?, ?, ?, 1, ?)
@@ -142,6 +158,79 @@ def _record_token_usage(model: str, inp: int, out: int, total: int) -> None:
         """, (model, inp, out, total, now))
         conn.commit()
         conn.close()
+
+
+def _get_metrics_history(period: str = "week") -> dict:
+    now = datetime.now(timezone.utc)
+    _periods = {
+        "day":     (1,   "%Y-%m-%dT%H", lambda i: (now - timedelta(hours=i)).strftime("%Y-%m-%dT%H"),
+                         lambda b: b[-2:] + ":00"),
+        "week":    (7,   "%Y-%m-%d",    lambda i: (now - timedelta(days=i)).strftime("%Y-%m-%d"),
+                         lambda b: b),
+        "month":   (30,  "%Y-%m-%d",    lambda i: (now - timedelta(days=i)).strftime("%Y-%m-%d"),
+                         lambda b: b),
+        "quarter": (90,  "%Y-%m-%d",    lambda i: (now - timedelta(days=i)).strftime("%Y-%m-%d"),
+                         lambda b: b),
+        "year":    (365, "%Y-%m",       lambda i: (now.replace(day=1) - timedelta(days=i*28)).strftime("%Y-%m"),
+                         lambda b: b),
+    }
+    days, fmt_str, bucket_fn, label_fn = _periods.get(period, _periods["week"])
+
+    if period == "day":
+        buckets = [bucket_fn(i) for i in range(23, -1, -1)]
+    elif period == "year":
+        seen, buckets = set(), []
+        for i in range(11, -1, -1):
+            b = (now.replace(day=1) - timedelta(days=i * 30)).strftime("%Y-%m")
+            if b not in seen:
+                seen.add(b); buckets.append(b)
+    else:
+        buckets = [bucket_fn(i) for i in range(days - 1, -1, -1)]
+
+    labels = [label_fn(b) for b in buckets]
+    cutoff = (now - timedelta(days=days)).isoformat()
+
+    try:
+        with _db_lock:
+            conn = _db_conn()
+            rows = conn.execute("""
+                SELECT model,
+                       strftime(?, recorded_at) AS bucket,
+                       SUM(input_tokens)  AS inp,
+                       SUM(output_tokens) AS out,
+                       SUM(total_tokens)  AS tot,
+                       COUNT(*)           AS calls
+                FROM token_events
+                WHERE recorded_at >= ?
+                GROUP BY model, bucket
+                ORDER BY bucket
+            """, (fmt_str, cutoff)).fetchall()
+            # Totales del período
+            totals_rows = conn.execute("""
+                SELECT model,
+                       SUM(input_tokens) AS inp, SUM(output_tokens) AS out,
+                       SUM(total_tokens) AS tot, COUNT(*) AS calls
+                FROM token_events WHERE recorded_at >= ?
+                GROUP BY model ORDER BY tot DESC
+            """, (cutoff,)).fetchall()
+            conn.close()
+    except Exception:
+        return {"labels": labels, "series": {}, "totals": [], "period": period}
+
+    bucket_idx = {b: i for i, b in enumerate(buckets)}
+    series: dict = {}
+    for row in rows:
+        m, b = row["model"], row["bucket"]
+        if b not in bucket_idx:
+            continue
+        if m not in series:
+            series[m] = [0] * len(buckets)
+        series[m][bucket_idx[b]] = row["tot"] or 0
+
+    totals = [{"model": r["model"], "input_tokens": r["inp"] or 0,
+               "output_tokens": r["out"] or 0, "total_tokens": r["tot"] or 0,
+               "call_count": r["calls"] or 0} for r in totals_rows]
+    return {"labels": labels, "series": series, "totals": totals, "period": period}
 
 
 def _get_token_metrics() -> list:
@@ -281,7 +370,7 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
         if message.startswith("__TOKEN_USAGE__ "):
             try:
                 tu = json.loads(message[len("__TOKEN_USAGE__ "):])
-                _record_token_usage(tu["model"], tu.get("input", 0), tu.get("output", 0), tu.get("total", 0))
+                _record_token_usage(tu["model"], tu.get("input", 0), tu.get("output", 0), tu.get("total", 0), job_id)
                 _emit("token_update", _get_token_metrics())
             except Exception:
                 pass
@@ -472,6 +561,14 @@ def get_metrics() -> list:
     return _get_token_metrics()
 
 
+@app.get("/metrics/history")
+def get_metrics_history(period: str = "week") -> dict:
+    valid = {"day", "week", "month", "quarter", "year"}
+    if period not in valid:
+        period = "week"
+    return _get_metrics_history(period)
+
+
 @app.get("/status")
 def get_all_status() -> dict:
     return {jid: job.to_dict() for jid, job in _jobs.items()}
@@ -531,6 +628,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fleet Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
@@ -638,35 +736,43 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 .alr-expand{background:none;border:none;color:#4a5568;cursor:pointer;font-size:.75rem;padding:.1rem .3rem;border-radius:3px;flex-shrink:0}
 .alr-expand:hover{color:#a0aec0;background:#2d3748}
 /* ── Métricas ── */
-#view-metrics{padding:1rem}
-.metrics-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.9rem;flex-wrap:wrap;gap:.5rem}
-.metrics-header h2{font-size:.88rem;font-weight:700;color:#e2e8f0}
-.metrics-updated{font-size:.68rem;color:#4a5568}
-.metrics-table{width:100%;border-collapse:collapse;font-size:.78rem}
-.metrics-table th{text-align:left;padding:.5rem .75rem;font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#4a5568;border-bottom:2px solid #2d3748;white-space:nowrap}
-.metrics-table th.num{text-align:right}
-.metrics-table td{padding:.55rem .75rem;border-bottom:1px solid #1e2535;color:#a0aec0;vertical-align:middle}
-.metrics-table td.num{text-align:right;font-family:monospace;color:#e2e8f0}
+#view-metrics{padding:1rem;max-width:1200px;margin:0 auto}
+.metrics-toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.9rem;flex-wrap:wrap;gap:.6rem}
+.metrics-toolbar h2{font-size:.88rem;font-weight:700;color:#e2e8f0}
+.metrics-updated{font-size:.67rem;color:#4a5568}
+.period-btns{display:flex;gap:.3rem;flex-wrap:wrap}
+.period-btn{font-size:.7rem;font-weight:600;padding:4px 11px;border-radius:6px;border:1px solid #2d3748;background:#1a1f2e;color:#718096;cursor:pointer;transition:all .15s}
+.period-btn:hover{background:#232b3e;color:#a0aec0}
+.period-btn.active{background:#1e3050;border-color:#3b5998;color:#63b3ed}
+.chart-wrap{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.75rem;margin-bottom:1rem;position:relative;height:260px}
+.chart-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#4a5568;font-size:.82rem;pointer-events:none}
+.metrics-totals{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
+.metric-card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.7rem .9rem;flex:1;min-width:120px}
+.metric-card .mc-val{font-size:1.2rem;font-weight:700;color:#63b3ed;font-family:monospace}
+.metric-card .mc-label{font-size:.63rem;color:#4a5568;margin-top:.15rem;text-transform:uppercase;letter-spacing:.05em}
+.metrics-table{width:100%;border-collapse:collapse;font-size:.77rem}
+.metrics-table th{text-align:left;padding:.45rem .7rem;font-size:.67rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#4a5568;border-bottom:2px solid #2d3748;white-space:nowrap}
+.metrics-table th.num,.metrics-table td.num{text-align:right}
+.metrics-table td{padding:.5rem .7rem;border-bottom:1px solid #1e2535;color:#a0aec0;vertical-align:middle}
+.metrics-table td.num{font-family:monospace;color:#e2e8f0}
 .metrics-table tr:hover td{background:#1e2535}
-.model-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.68rem;font-weight:700;white-space:nowrap}
+.model-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.67rem;font-weight:700;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
 .model-minimax{background:#1a2e4a;color:#63b3ed;border:1px solid #1e3a5f}
 .model-qwen{background:#1a2e1a;color:#68d391;border:1px solid #1a3a1a}
 .model-nvidia{background:#1a2a1a;color:#48bb78;border:1px solid #1a3a1a}
 .model-llama{background:#2a1a2e;color:#b794f4;border:1px solid #3a1a4a}
 .model-other{background:#2d3748;color:#a0aec0;border:1px solid #4a5568}
-.bar-wrap{display:flex;align-items:center;gap:.5rem}
-.bar-bg{flex:1;height:6px;background:#1e2535;border-radius:3px;min-width:60px;overflow:hidden}
+.bar-wrap{display:flex;align-items:center;gap:.4rem}
+.bar-bg{flex:1;height:5px;background:#1e2535;border-radius:3px;min-width:50px;overflow:hidden}
 .bar-fill{height:100%;border-radius:3px;transition:width .4s ease}
 .bar-input{background:#3b5998}
 .bar-output{background:#2d6a4f}
 .metrics-empty{color:#4a5568;font-size:.82rem;text-align:center;padding:3rem 1rem}
-.metrics-totals{margin-top:1rem;display:flex;gap:1rem;flex-wrap:wrap}
-.metric-card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:.75rem 1rem;flex:1;min-width:140px}
-.metric-card .mc-val{font-size:1.3rem;font-weight:700;color:#63b3ed;font-family:monospace}
-.metric-card .mc-label{font-size:.65rem;color:#4a5568;margin-top:.2rem;text-transform:uppercase;letter-spacing:.05em}
 @media(max-width:600px){
-  .metrics-table th:nth-child(4),.metrics-table td:nth-child(4){display:none}
-  #view-metrics{padding:.6rem}
+  .metrics-table th:nth-child(4),.metrics-table td:nth-child(4),
+  .metrics-table th:nth-child(6),.metrics-table td:nth-child(6){display:none}
+  #view-metrics{padding:.55rem}
+  .chart-wrap{height:200px}
 }
 </style>
 </head>
@@ -696,22 +802,35 @@ main{padding:1rem;display:grid;gap:.85rem;grid-template-columns:repeat(auto-fill
 </div><!-- /view-jobs -->
 <div id="view-metrics" class="tab-panel">
   <div id="view-metrics-inner">
-    <div class="metrics-header">
+    <div class="metrics-toolbar">
       <h2>Uso de tokens por modelo</h2>
-      <span class="metrics-updated" id="metrics-updated"></span>
+      <div style="display:flex;align-items:center;gap:.8rem;flex-wrap:wrap">
+        <div class="period-btns">
+          <button class="period-btn" id="pb-day"     onclick="setPeriod('day')">24 h</button>
+          <button class="period-btn active" id="pb-week" onclick="setPeriod('week')">7 d</button>
+          <button class="period-btn" id="pb-month"   onclick="setPeriod('month')">30 d</button>
+          <button class="period-btn" id="pb-quarter" onclick="setPeriod('quarter')">90 d</button>
+          <button class="period-btn" id="pb-year"    onclick="setPeriod('year')">1 año</button>
+        </div>
+        <span class="metrics-updated" id="metrics-updated"></span>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="tokens-chart"></canvas>
+      <div class="chart-empty" id="chart-empty">Sin datos para el período seleccionado.</div>
     </div>
     <div class="metrics-totals" id="metrics-totals"></div>
-    <div style="margin-top:1rem;overflow-x:auto">
-      <table class="metrics-table" id="metrics-table">
+    <div style="overflow-x:auto">
+      <table class="metrics-table">
         <thead><tr>
           <th>Modelo</th>
           <th class="num">Llamadas</th>
           <th class="num">Tokens entrada</th>
           <th class="num">Tokens salida</th>
           <th class="num">Total tokens</th>
-          <th style="min-width:120px">Distribución</th>
+          <th style="min-width:110px">Distribución</th>
         </tr></thead>
-        <tbody id="metrics-tbody"><tr><td colspan="6" class="metrics-empty">Cargando métricas…</td></tr></tbody>
+        <tbody id="metrics-tbody"><tr><td colspan="6" class="metrics-empty">Cargando…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -780,6 +899,16 @@ function switchTab(name){
 }
 
 // ── Métricas ──
+let _activePeriod='week';
+let _chart=null;
+const MODEL_COLORS=['#4299e1','#68d391','#b794f4','#f6ad55','#fc8181','#76e4f7','#e2e8f0','#fbd38d'];
+const MODEL_COLOR_MAP={};
+let _colorIdx=0;
+
+function modelColor(m){
+  if(!MODEL_COLOR_MAP[m])MODEL_COLOR_MAP[m]=MODEL_COLORS[_colorIdx++%MODEL_COLORS.length];
+  return MODEL_COLOR_MAP[m];
+}
 function modelClass(m){
   const l=m.toLowerCase();
   if(l.includes('minimax'))return'model-minimax';
@@ -790,48 +919,97 @@ function modelClass(m){
 }
 function fmt(n){return Number(n||0).toLocaleString('es-CL');}
 
-function renderMetrics(rows){
+function setPeriod(p){
+  _activePeriod=p;
+  document.querySelectorAll('.period-btn').forEach(b=>b.classList.remove('active'));
+  const pb=document.getElementById('pb-'+p);if(pb)pb.classList.add('active');
+  loadMetrics();
+}
+
+function renderChart(labels,series){
+  const canvas=document.getElementById('tokens-chart');
+  const emptyEl=document.getElementById('chart-empty');
+  const hasData=Object.values(series).some(arr=>arr.some(v=>v>0));
+  emptyEl.style.display=hasData?'none':'flex';
+  canvas.style.display=hasData?'block':'none';
+  if(!hasData){if(_chart){_chart.destroy();_chart=null;}return;}
+  const datasets=Object.entries(series).map(([model,data])=>({
+    label:model.split('/').pop(),
+    data,
+    backgroundColor:modelColor(model)+'cc',
+    borderColor:modelColor(model),
+    borderWidth:1,
+    borderRadius:2,
+    stack:'total',
+  }));
+  if(_chart){
+    _chart.data.labels=labels;
+    _chart.data.datasets=datasets;
+    _chart.update('none');
+    return;
+  }
+  _chart=new Chart(canvas,{
+    type:'bar',
+    data:{labels,datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{
+        legend:{position:'bottom',labels:{color:'#a0aec0',boxWidth:12,font:{size:11}}},
+        tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${fmt(ctx.parsed.y)} tokens`}},
+      },
+      scales:{
+        x:{stacked:true,ticks:{color:'#718096',font:{size:10},maxRotation:45},grid:{color:'#1e2535'}},
+        y:{stacked:true,ticks:{color:'#718096',font:{size:10},callback:v=>v>=1000?Math.round(v/1000)+'k':v},grid:{color:'#1e2535'}},
+      },
+    },
+  });
+}
+
+function renderTable(rows){
   const tbody=document.getElementById('metrics-tbody');
   const totals=document.getElementById('metrics-totals');
-  document.getElementById('metrics-updated').textContent='Actualizado: '+new Date().toLocaleTimeString('es-CL');
   if(!rows||!rows.length){
-    tbody.innerHTML='<tr><td colspan="6" class="metrics-empty">Sin datos aún. Los tokens se registran cuando corren jobs.</td></tr>';
+    tbody.innerHTML='<tr><td colspan="6" class="metrics-empty">Sin datos para el período seleccionado.</td></tr>';
     totals.innerHTML='';return;
   }
-  const maxTotal=Math.max(...rows.map(r=>r.total_tokens||0),1);
-  const sumIn=rows.reduce((a,r)=>a+(r.input_tokens||0),0);
-  const sumOut=rows.reduce((a,r)=>a+(r.output_tokens||0),0);
-  const sumTot=rows.reduce((a,r)=>a+(r.total_tokens||0),0);
-  const sumCalls=rows.reduce((a,r)=>a+(r.call_count||0),0);
+  const maxTot=Math.max(...rows.map(r=>r.total_tokens||0),1);
+  const sIn=rows.reduce((a,r)=>a+(r.input_tokens||0),0);
+  const sOut=rows.reduce((a,r)=>a+(r.output_tokens||0),0);
+  const sTot=rows.reduce((a,r)=>a+(r.total_tokens||0),0);
+  const sCalls=rows.reduce((a,r)=>a+(r.call_count||0),0);
   totals.innerHTML=`
-    <div class="metric-card"><div class="mc-val">${fmt(sumTot)}</div><div class="mc-label">Tokens totales</div></div>
-    <div class="metric-card"><div class="mc-val">${fmt(sumIn)}</div><div class="mc-label">Tokens entrada</div></div>
-    <div class="metric-card"><div class="mc-val">${fmt(sumOut)}</div><div class="mc-label">Tokens salida</div></div>
-    <div class="metric-card"><div class="mc-val">${fmt(sumCalls)}</div><div class="mc-label">Llamadas LLM</div></div>`;
+    <div class="metric-card"><div class="mc-val">${fmt(sTot)}</div><div class="mc-label">Tokens totales</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sIn)}</div><div class="mc-label">Entrada</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sOut)}</div><div class="mc-label">Salida</div></div>
+    <div class="metric-card"><div class="mc-val">${fmt(sCalls)}</div><div class="mc-label">Llamadas LLM</div></div>`;
   tbody.innerHTML=rows.map(r=>{
-    const pctIn =Math.round(((r.input_tokens||0)/maxTotal)*100);
-    const pctOut=Math.round(((r.output_tokens||0)/maxTotal)*100);
-    const shortName=r.model.split('/').pop();
+    const pIn=Math.round(((r.input_tokens||0)/maxTot)*100);
+    const pOut=Math.round(((r.output_tokens||0)/maxTot)*100);
+    const short=r.model.split('/').pop();
     return`<tr>
-      <td><span class="model-pill ${modelClass(r.model)}" title="${esc(r.model)}">${esc(shortName)}</span></td>
+      <td><span class="model-pill ${modelClass(r.model)}" title="${esc(r.model)}" style="border-left:3px solid ${modelColor(r.model)}">${esc(short)}</span></td>
       <td class="num">${fmt(r.call_count)}</td>
       <td class="num">${fmt(r.input_tokens)}</td>
       <td class="num">${fmt(r.output_tokens)}</td>
       <td class="num">${fmt(r.total_tokens)}</td>
       <td>
-        <div class="bar-wrap">
-          <div class="bar-bg"><div class="bar-fill bar-input" style="width:${pctIn}%"></div></div>
-        </div>
-        <div class="bar-wrap" style="margin-top:3px">
-          <div class="bar-bg"><div class="bar-fill bar-output" style="width:${pctOut}%"></div></div>
-        </div>
+        <div class="bar-wrap"><div class="bar-bg"><div class="bar-fill bar-input" style="width:${pIn}%"></div></div></div>
+        <div class="bar-wrap" style="margin-top:2px"><div class="bar-bg"><div class="bar-fill bar-output" style="width:${pOut}%"></div></div></div>
       </td>
     </tr>`;
   }).join('');
 }
 
 function loadMetrics(){
-  fetch('/metrics').then(r=>r.json()).then(renderMetrics).catch(()=>{});
+  document.getElementById('metrics-updated').textContent='Cargando…';
+  fetch('/metrics/history?period='+_activePeriod)
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById('metrics-updated').textContent='Actualizado '+new Date().toLocaleTimeString('es-CL');
+      renderChart(d.labels||[],d.series||{});
+      renderTable(d.totals||[]);
+    })
+    .catch(()=>{document.getElementById('metrics-updated').textContent='Error cargando métricas';});
 }
 let sortField='started_at',sortDir='desc';
 const STATUS_ORDER={running:0,queued:1,approved:2,rejected:3,error:4,stopped:5};
