@@ -151,6 +151,101 @@ make install    # Detectar agente instalado y registrar MCP automáticamente
 
 ---
 
+## Dashboard
+
+El dashboard web está disponible en `http://localhost:8000/` (o la IP Tailscale del host). No requiere login.
+
+### Pestaña: Ejecuciones
+
+Vista principal del fleet en tiempo real.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  ● Fleet Dashboard          Conectado   [📋 Ver logs]   │
+├────────────┬────────────────────────────────────────────┤
+│ Ejecuciones│ Métricas de tokens                         │
+├────────────┴────────────────────────────────────────────┤
+│ Ordenar: [Nombre ↑] [Estado] [Edad ↓] [Ciclo] [Archivos]│
+├─────────────────────────────────────────────────────────┤
+│ ┌───────────────────────────────────────────────────┐   │
+│ │ SCRUM-45                          [⏹ Detener] 🔄  │   │
+│ │ ● Desarrollando · Ciclo 2 · 8 arch. · 4m 12s      │   │
+│ │ [18:32:01] Escribiendo implementación...           │   │
+│ │ ▼ ver logs completos                               │   │
+│ └───────────────────────────────────────────────────┘   │
+│  ...                                                     │
+├─────────────────────────────────────────────────────────┤
+│ Por página: [10▾]              ‹  1 / 4  ›              │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Tarjetas de ejecución** — cada job muestra:
+
+| Campo | Descripción |
+|---|---|
+| Ticket ID | Enlace visual al ticket Jira |
+| Estado | `running` · `queued` · `approved` · `rejected` · `error` · `stopped` · `interrupted` |
+| Fase actual | Contexto · Desarrollando · Revisando · Actualizando Jira |
+| Ciclo | Iteración de dev→review actual |
+| Archivos | Cantidad de archivos modificados en el workspace |
+| Tiempo transcurrido | Actualizado en tiempo real cada segundo |
+| Preview de logs | Últimas 3 líneas del agente |
+
+**Controles:**
+
+- **Ordenar** — barra con 5 criterios: Nombre (alfabético), Estado (running primero), Edad, Ciclo, Archivos. Clic al criterio activo alterna ↑ ascendente / ↓ descendente.
+- **Paginación** — selector de 5 / 10 / 25 tarjetas por página.
+- **⏹ Detener** — envía señal de parada graciosa al job (termina el step actual y actualiza Jira antes de salir).
+- **▼ ver logs completos** — abre modal a pantalla completa con el log íntegro del agente. El scroll sigue automáticamente si estás al final.
+
+**Vista móvil** (< 600 px): las tarjetas colapsan a filas compactas (sin preview de log). Toca una fila para expandirla al modo tarjeta completo.
+
+**Botón "📋 Ver logs"** (header) — abre un panel con todas las ejecuciones, incluyendo el badge de estado, fase, ciclo y los botones directos a Jira y al PR de GitHub si el agente lo creó.
+
+**Indicador de conexión** — punto verde (pulsante) = SSE activo; punto rojo = reconectando. El dashboard se reconecta automáticamente sin perder el estado.
+
+---
+
+### Pestaña: Métricas de tokens
+
+Consumo acumulado de tokens por modelo LLM, con histórico gráfico.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Uso de tokens por modelo    [24h][7d][30d][90d][1 año]  │
+│                                          Actualizado... │
+├─────────────────────────────────────────────────────────┤
+│  [Gráfico barras apiladas — tokens por día/hora]        │
+│   Eje X: fecha/hora según período                       │
+│   Eje Y: tokens (k)   · Colores por modelo              │
+├─────────────────────────────────────────────────────────┤
+│ 1,234,567   234,567   1,000,000   42                    │
+│ Tokens tot.  Entrada   Salida      Llamadas LLM         │
+├────────────────────┬───────┬───────┬──────┬────┬───────┤
+│ Modelo             │ Calls │ Entr. │ Sal. │Tot │ Dist. │
+├────────────────────┼───────┼───────┼──────┼────┼───────┤
+│ MiniMax-M2.7       │   31  │ 890k  │ 344k │...│ ████  │
+│ qwen3-coder:free   │    8  │ 123k  │  45k │...│ ██    │
+│ llama-3.3-70b:free │    3  │  44k  │  12k │...│ █     │
+└────────────────────┴───────┴───────┴──────┴────┴───────┘
+```
+
+**Períodos disponibles:**
+
+| Botón | Ventana | Agrupación |
+|---|---|---|
+| 24 h | Últimas 24 horas | Por hora |
+| 7 d | Últimos 7 días | Por día |
+| 30 d | Últimos 30 días | Por día |
+| 90 d | Últimos 90 días | Por día |
+| 1 año | Últimos 365 días | Por mes |
+
+- Los datos se almacenan en la tabla `token_events` de `fleet.db` y persisten entre reinicios.
+- El gráfico y la tabla se actualizan **en tiempo real** vía SSE mientras hay jobs corriendo: cada llamada al LLM emite un evento `token_update` al dashboard si la pestaña está activa.
+- La **barra de distribución** (columna Dist.) muestra la proporción relativa de tokens de entrada (azul) y salida (verde) de cada modelo respecto al modelo con mayor consumo.
+
+---
+
 ## API
 
 Ver `openapi.yaml` para el schema completo. Endpoints principales:
@@ -158,11 +253,16 @@ Ver `openapi.yaml` para el schema completo. Endpoints principales:
 | Método | Path | Descripción |
 |---|---|---|
 | `POST` | `/run` | Lanzar ticket (async) |
+| `POST` | `/stop/{job_id}` | Detener job en curso |
 | `GET` | `/status` | Todos los jobs activos |
 | `GET` | `/status/{job_id}` | Job específico |
 | `GET` | `/events` | SSE — stream en tiempo real |
+| `GET` | `/metrics` | Totales de tokens por modelo (acumulado) |
+| `GET` | `/metrics/history?period=week` | Serie temporal por período |
 | `GET` | `/` | Dashboard web |
 | `GET` | `/health` | Health check |
+
+**Períodos válidos para `/metrics/history`:** `day` · `week` · `month` · `quarter` · `year`
 
 ---
 
