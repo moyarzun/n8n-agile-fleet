@@ -100,6 +100,56 @@ _OR_REVIEWER_CHAIN = [
 ]
 
 
+# ===========================================================================
+# Guardrails de ingeniería — lecciones destiladas de fallos reales en prod.
+# Se inyectan en CADA prompt del desarrollador para no repetir los mismos errores.
+# ===========================================================================
+ENGINEERING_GUARDRAILS = """
+REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
+
+[GROUNDING — la fuente de verdad existe; NO inventes]
+- NUNCA escribas un modelo/clase desde la imaginación. Antes de tocar un modelo
+  Rails, alinéate con TRES fuentes ya presentes en el repo y hazlas coincidir:
+  (1) el SPEC del modelo (spec/models/*_spec.rb) = el contrato de comportamiento,
+  (2) la FACTORY (spec/factories/*.rb) = los atributos/valores esperados,
+  (3) el ESQUEMA real de la tabla (db/schema.rb y db/*migrate*/*create_*).
+  Si los tres divergen, el SPEC manda; ajusta modelo+migración+factory a él.
+- Usa EXACTAMENTE los nombres de columna que existen en la migración. No traduzcas
+  inglés↔español (estado/status, accion/action, tipo/type) por tu cuenta.
+
+[ACTIVE RECORD / ENUMS — causa #1 de crashes con eager_load]
+- Todo `enum :campo` DEBE tener una columna backing en la tabla, o un
+  `attribute :campo, :string|:integer` explícito ANTES del enum. Sin eso, en
+  producción con eager_load=false explota: "Undeclared attribute type for enum".
+- Modelos de TENANT heredan de TenantRecord; modelos de control de ApplicationRecord.
+  Una tabla en db/tenant_migrate/ ⇒ el modelo es TenantRecord (NO ApplicationRecord).
+  No declares belongs_to/has_many cruzando control↔tenant (conexiones distintas).
+
+[MIGRACIONES]
+- Toda columna que el modelo/scope/validación usa debe existir en una migración.
+- enum integer ⇒ columna integer; enum string ⇒ columna string. Deben coincidir.
+
+[TESTS — sin esto el trabajo NO está hecho]
+- Cada spec de modelo debe iniciar con `require "rails_helper"` (no hay .rspec).
+- Un cambio no está terminado hasta que su spec pasa Y el código parsea (`ruby -c`).
+- No uses placeholders ('...', '# TODO', '# resto') — el archivo va completo.
+
+[NO ROMPAS EL BOOT]
+- No crees initializers que llamen a APIs de gemas inexistentes ni con sintaxis
+  inválida. Si dudas de que una gema/clase exista, NO la uses.
+""".strip()
+
+# Playbooks por especialidad: refuerzo de rol además de las guardrails comunes.
+ROLE_PLAYBOOKS = {
+    "Rails":      "Enfócate en modelo+migración+spec coherentes. enum⇒columna/attribute. TenantRecord para tablas de tenant.",
+    "Backend":    "Igual que Rails. Valida con rspec los archivos tocados. Controllers delgados.",
+    "Schema":     "Eres el guardián del esquema: reconcilia spec↔factory↔tabla. Agrega columnas faltantes vía migración idempotente.",
+    "Mobile":     "Flutter/Dart. Respeta el contrato de la API (campos snake_case del backend). No rompas el build (`flutter analyze`).",
+    "Flutter":    "Flutter/Dart. Respeta el contrato de la API. Mantén el build verde (`flutter analyze`).",
+    "Full-Stack": "Triangula spec↔factory↔esquema antes de codificar. Tras escribir, todo debe parsear y los specs tocados pasar.",
+}
+
+
 def _extract_token_usage(response: object, model_name: str) -> None:
     """Emite una línea estructurada con el uso de tokens de la respuesta."""
     try:
@@ -258,11 +308,165 @@ def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
             content = content.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "")
         full_path = os.path.join(workspace, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        # Eliminar antes de escribir para evitar deadlock VirtioFS (Errno 35):
+        # los archivos existentes en volúmenes macOS heredan xattrs que bloquean escritura.
+        if os.path.exists(full_path):
+            try:
+                os.unlink(full_path)
+            except OSError:
+                pass
         with open(full_path, "w") as fh:
             fh.write(content)
         applied.append(rel_path)
         logger.info("Archivo escrito: %s", full_path)
     return applied
+
+
+# ===========================================================================
+# 2b. Helpers de stack, git (GitFlow) y validación determinista
+# ===========================================================================
+def _run(cmd: list, cwd: str, timeout: int = 120) -> tuple:
+    """Ejecuta un comando y devuelve (returncode, salida_combinada)."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, f"TIMEOUT tras {timeout}s: {' '.join(cmd)}"
+    except FileNotFoundError:
+        return 127, f"comando no encontrado: {cmd[0]}"
+    except Exception as e:  # noqa: BLE001
+        return 1, f"error ejecutando {cmd}: {e}"
+
+
+def _tool_available(tool: str) -> bool:
+    rc, _ = _run([tool, "--version"], cwd="/", timeout=15)
+    return rc == 0
+
+
+def _detect_stack(workspace: str) -> str:
+    """rails | flutter | node | generic, según los archivos marcador del repo."""
+    has = lambda f: os.path.exists(os.path.join(workspace, f))  # noqa: E731
+    if has("Gemfile") and (has("config/application.rb") or has("bin/rails")):
+        return "rails"
+    if has("pubspec.yaml"):
+        return "flutter"
+    if has("package.json"):
+        return "node"
+    return "generic"
+
+
+def _git(args: list, workspace: str, timeout: int = 60) -> tuple:
+    return _run(["git", *args], cwd=workspace, timeout=timeout)
+
+
+def _is_git_repo(workspace: str) -> bool:
+    rc, out = _git(["rev-parse", "--is-inside-work-tree"], workspace)
+    return rc == 0 and "true" in out
+
+
+def _slugify(text: str, maxlen: int = 40) -> str:
+    s = _re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return (s[:maxlen]).strip("-") or "cambios"
+
+
+def _rails_grounding(workspace: str, criteria: str, max_bytes: int = 6000) -> str:
+    """Triangulación spec↔factory↔esquema: el contexto que evita modelos inventados.
+
+    Adjunta db/schema.rb (recortado), y los spec/factory cuyo nombre aparezca en los
+    criterios del ticket (heurística por palabra clave del título/descripción).
+    """
+    parts = []
+    # Esquema de control
+    schema = os.path.join(workspace, "db", "schema.rb")
+    if os.path.exists(schema):
+        with open(schema, "r", errors="replace") as fh:
+            parts.append(f"===SCHEMA: db/schema.rb (recortado)===\n{fh.read(max_bytes)}\n===END===")
+    # Palabras candidatas (nombres de modelo/recurso) extraídas de los criterios
+    words = {w.lower() for w in _re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", criteria or "")}
+    def _attach_matching(subdir: str, label: str):
+        base = os.path.join(workspace, subdir)
+        if not os.path.isdir(base):
+            return
+        for root, _d, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(".rb"):
+                    continue
+                stem = fn.replace("_spec.rb", "").replace(".rb", "")
+                if stem in words or stem.rstrip("s") in words:
+                    fp = os.path.join(root, fn)
+                    try:
+                        with open(fp, "r", errors="replace") as fh:
+                            rel = os.path.relpath(fp, workspace)
+                            parts.append(f"==={label}: {rel}===\n{fh.read(max_bytes)}\n===END===")
+                    except Exception:  # noqa: BLE001
+                        pass
+    _attach_matching("spec/models", "SPEC")
+    _attach_matching("spec/factories", "FACTORY")
+    _attach_matching("db/tenant_migrate", "MIGRATION")
+    _attach_matching("db/migrate", "MIGRATION")
+    if not parts:
+        return ""
+    return ("# GROUNDING (fuente de verdad — el código nuevo DEBE coincidir con esto):\n"
+            + "\n".join(parts))
+
+
+def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tuple:
+    """Validación DETERMINISTA del código generado. Devuelve (passed, reporte).
+
+    Niveles (best-effort según herramientas disponibles en el contenedor):
+      1. Sintaxis Ruby (`ruby -c`) sobre cada .rb tocado — siempre que haya ruby.
+      2. Comando de validación del proyecto si existe (FLEET_VALIDATE_CMD,
+         `bin/fleet-validate` o `make validate`) — aquí el proyecto corre SUS tests
+         (rspec, flutter analyze, etc.) en un entorno con su toolchain.
+    Si NINGÚN nivel pudo correr, passed=False con aviso (no aprobar a ciegas).
+    """
+    report = []
+    ran_any = False
+    ok = True
+
+    # ── Nivel 1: sintaxis Ruby ──────────────────────────────────────────────
+    rb_files = [f for f in applied_files if f.endswith(".rb")]
+    if rb_files and _tool_available("ruby"):
+        ran_any = True
+        syntax_errors = []
+        for rel in rb_files:
+            rc, out = _run(["ruby", "-c", rel], cwd=workspace, timeout=30)
+            if rc != 0:
+                syntax_errors.append(f"  ✗ {rel}: {out.strip().splitlines()[-1] if out.strip() else 'syntax error'}")
+        if syntax_errors:
+            ok = False
+            report.append("SINTAXIS RUBY (ruby -c) — ERRORES:\n" + "\n".join(syntax_errors))
+        else:
+            report.append(f"SINTAXIS RUBY: ✓ {len(rb_files)} archivos .rb parsean correctamente.")
+
+    # ── Nivel 2: comando de validación del proyecto (tests reales) ───────────
+    validate_cmd = os.getenv("FLEET_VALIDATE_CMD")
+    candidates = []
+    if validate_cmd:
+        candidates.append(validate_cmd.split())
+    if os.path.exists(os.path.join(workspace, "bin", "fleet-validate")):
+        candidates.append(["bin/fleet-validate"])
+    if os.path.exists(os.path.join(workspace, "Makefile")):
+        rc, out = _run(["grep", "-q", "^validate:", "Makefile"], cwd=workspace, timeout=10)
+        if rc == 0:
+            candidates.append(["make", "validate"])
+    if candidates:
+        ran_any = True
+        cmd = candidates[0]
+        rc, out = _run(cmd, cwd=workspace, timeout=int(os.getenv("FLEET_VALIDATE_TIMEOUT", "600")))
+        tail = "\n".join(out.strip().splitlines()[-40:])
+        if rc == 0:
+            report.append(f"VALIDACIÓN PROYECTO (`{' '.join(cmd)}`): ✓ exit 0\n{tail}")
+        else:
+            ok = False
+            report.append(f"VALIDACIÓN PROYECTO (`{' '.join(cmd)}`): ✗ exit {rc}\n{tail}")
+
+    if not ran_any:
+        return False, ("No se pudo correr ninguna validación determinista (sin ruby ni "
+                       "comando de validación del proyecto). Define FLEET_VALIDATE_CMD o "
+                       "agrega bin/fleet-validate / target `validate` en el Makefile del "
+                       "workspace para que la Flota ejecute los tests reales.")
+    return ok, "\n\n".join(report)
 
 
 # ===========================================================================
@@ -279,6 +483,14 @@ class FleetState(TypedDict):
     reviewer_feedback:   str
     is_approved:         bool
     loop_iterations:     int
+    # ── GitFlow + validación + planificación ──
+    stack:               str         # rails | flutter | node | generic
+    base_branch:         str         # rama base (main/develop) sobre la que se ramifica
+    work_branch:         str         # rama de trabajo fleet/<ticket>-<slug>
+    subtasks:            List[str]   # descomposición del ticket (planner)
+    validation_report:   str         # salida determinista (ruby -c / tests)
+    validation_passed:   bool        # gate determinista
+    pr_url:              str         # URL del PR si se abrió
 
 
 class ReviewerDecision(BaseModel):
@@ -308,14 +520,99 @@ def fetch_and_plan_node(state: FleetState) -> dict:
     _log(f"[context_ingestion] Criterios: {desc_preview}")
 
     context_string = f"TITULO: {summary}\n\nCRITERIOS DE ACEPTACION:\n{description}"
+    stack = _detect_stack(state["workspace_path"])
+    _log(f"[context_ingestion] Stack detectado: {stack}")
     return {
         "acceptance_criteria": context_string,
         "required_agents":     required_agents,
+        "stack":               stack,
         "is_approved":         False,
+        "validation_passed":   False,
         "loop_iterations":     0,
         "current_code_diff":   {},
         "applied_files":       [],
-        "messages":            [AIMessage(content=f"Agentes requeridos: {required_agents}", name="Planner")],
+        "messages":            [AIMessage(content=f"Agentes requeridos: {required_agents} · stack={stack}", name="Planner")],
+    }
+
+
+def git_setup_node(state: FleetState) -> dict:
+    """GitFlow: crea una rama de trabajo aislada por ticket. NUNCA se trabaja en main.
+
+    Determina la rama base (main/develop) y crea fleet/<ticket>-<slug> desde ella.
+    Si el workspace no es repo git, degrada a modo sin-git (avisa) y continúa.
+    """
+    workspace = state["workspace_path"]
+    ticket    = state["ticket_id"]
+
+    if not _tool_available("git") or not _is_git_repo(workspace):
+        _log("[git_setup] AVISO: workspace no es repo git o git no disponible → modo sin-git")
+        return {"base_branch": "", "work_branch": "",
+                "messages": [AIMessage(content="git no disponible; sin aislamiento por rama", name="GitOps")]}
+
+    # Rama base: develop si existe (GitFlow), si no la rama por defecto del repo.
+    rc, out = _git(["rev-parse", "--verify", "develop"], workspace)
+    if rc == 0:
+        base = "develop"
+    else:
+        rc, out = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], workspace)
+        base = out.strip().split("/")[-1] if rc == 0 and out.strip() else "main"
+
+    slug   = _slugify(state.get("acceptance_criteria", "").split("\n")[0].replace("TITULO:", ""))
+    branch = f"fleet/{ticket}-{slug}"
+
+    # Asegurar árbol limpio y partir desde la base actualizada.
+    _git(["stash", "-u"], workspace)
+    _git(["checkout", base], workspace)
+    _git(["pull", "--ff-only"], workspace, timeout=120)
+    rc, out = _git(["checkout", "-B", branch, base], workspace)
+    if rc != 0:
+        _log(f"[git_setup] No se pudo crear rama {branch}: {out.strip()[:160]}")
+        return {"base_branch": base, "work_branch": "",
+                "messages": [AIMessage(content=f"No se pudo ramificar: {out.strip()[:120]}", name="GitOps")]}
+
+    _log(f"[git_setup] Rama de trabajo: {branch} (base: {base})")
+    return {
+        "base_branch": base,
+        "work_branch": branch,
+        "messages": [AIMessage(content=f"Rama de trabajo {branch} creada desde {base}", name="GitOps")],
+    }
+
+
+def planner_node(state: FleetState) -> dict:
+    """Descompone el ticket en subtareas ordenadas y verificables, ancladas al código real.
+
+    Fragmentar evita el "code dump" monolítico que trunca y alucina: el desarrollador
+    trabaja sobre una checklist concreta (p.ej. schema → modelo → spec → controller).
+    """
+    criteria  = state["acceptance_criteria"]
+    stack     = state.get("stack", "generic")
+    workspace = state["workspace_path"]
+
+    grounding = _rails_grounding(workspace, criteria) if stack == "rails" else ""
+    sys = SystemMessage(content=(
+        "Eres el Tech Lead. Descompón el ticket en 2 a 6 subtareas atómicas, ordenadas "
+        "por dependencia y CADA una verificable (qué archivo se toca y cómo se comprueba). "
+        "Para Rails el orden típico es: migración/esquema → modelo (enum⇒columna/attribute) "
+        "→ factory → spec (require rails_helper) → controller. "
+        "Responde SOLO un array JSON de strings, sin texto extra."
+    ))
+    human = HumanMessage(content=f"TICKET:\n{criteria}\n\n{grounding}\n\nDevuelve el array JSON de subtareas.")
+    try:
+        raw = _invoke_reviewer([sys, human])
+        content = raw.content if hasattr(raw, "content") else str(raw)
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
+        lo, hi = content.find("["), content.rfind("]")
+        arr = _json.loads(content[lo:hi + 1]) if lo != -1 and hi > lo else []
+        subtasks = [str(x) for x in arr][:6]
+    except Exception as e:  # noqa: BLE001
+        _log(f"[planner] No se pudo descomponer ({e}); se usa el ticket completo")
+        subtasks = []
+
+    if subtasks:
+        _log("[planner] Subtareas:\n" + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(subtasks)))
+    return {
+        "subtasks": subtasks,
+        "messages": [AIMessage(content=f"{len(subtasks)} subtareas planificadas", name="TechLead")],
     }
 
 
@@ -354,21 +651,32 @@ def dynamic_developer_node(state: FleetState) -> dict:
     if feedback and feedback != "Implementacion inicial requerida.":
         _log(f"[dynamic_developer] Feedback del revisor: {feedback[:150]}")
 
+    stack       = state.get("stack", "generic")
+    subtasks    = state.get("subtasks", [])
+    grounding   = _rails_grounding(workspace, criteria) if stack == "rails" else ""
+    subtask_txt = ("PLAN DE SUBTAREAS (impleméntalas todas, en orden):\n"
+                   + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(subtasks)) + "\n\n") if subtasks else ""
+
     for agent_role in agents:
+        playbook = ROLE_PLAYBOOKS.get(agent_role, ROLE_PLAYBOOKS["Full-Stack"])
         system_instruction = (
-            f"Eres un experto en {agent_role}. Tu unica tarea es escribir codigo.\n"
-            "NO expliques nada. NO describas lo que vas a hacer.\n"
+            f"Eres un experto en {agent_role}. {playbook}\n"
+            "Tu unica tarea es escribir codigo. NO expliques nada. NO describas lo que vas a hacer.\n"
             "SOLO escribe los archivos usando el formato especificado.\n\n"
+            + ENGINEERING_GUARDRAILS + "\n\n"
             "CRITICO — REGLAS ANTI-TRUNCACION:\n"
             "1. Cada archivo debe estar COMPLETO desde la primera hasta la ultima linea.\n"
             "2. NUNCA uses '...', '# rest of implementation', '// TODO', '# continua...' ni ningun placeholder.\n"
             "3. Si un archivo seria muy grande, divídelo en archivos mas pequeños cohesivos en lugar de truncar.\n"
-            "4. El ultimo caracter de cada bloque FILE_BEGIN/FILE_END debe ser el cierre real del archivo.\n\n"
+            "4. El ultimo caracter de cada bloque FILE_BEGIN/FILE_END debe ser el cierre real del archivo.\n"
+            "5. NO escapes comillas ni saltos de linea: escribe el archivo tal cual debe quedar en disco.\n\n"
             + FORMAT_EXAMPLE
         )
         human_instruction = (
             f"CRITERIOS DEL TICKET:\n{criteria}\n\n"
-            f"RETROALIMENTACION DEL REVISOR:\n{feedback}\n\n"
+            f"{subtask_txt}"
+            f"{grounding}\n\n"
+            f"RESULTADO DE LA VALIDACION/REVISION ANTERIOR (corrige ESTO primero):\n{feedback}\n\n"
             f"CONTEXTO DEL WORKSPACE:\n{workspace_context}\n\n"
             f"ARCHIVOS YA EN DISCO: {prev_applied}\n\n"
             "Escribe ahora TODOS los archivos necesarios usando bloques "
@@ -434,6 +742,35 @@ def _read_applied_files(workspace: str, applied_files: list, max_bytes: int = 30
     return "\n".join(parts)
 
 
+def validation_gate_node(state: FleetState) -> dict:
+    """Gate DETERMINISTA: ejecuta el código real (sintaxis + tests del proyecto).
+
+    Es la corrección central a la causa raíz de esta epopeya: antes, la única
+    "revisión" era un LLM leyendo archivos truncados → aprobaba código que ni
+    siquiera parseaba o booteaba. Ahora ningún cambio avanza sin pasar checks
+    ejecutables. El reporte (errores reales) se realimenta al desarrollador.
+    """
+    workspace     = state["workspace_path"]
+    applied_files = state.get("applied_files", [])
+    stack         = state.get("stack", "generic")
+
+    if not applied_files:
+        _log("[validation_gate] Sin archivos que validar.")
+        return {"validation_passed": False,
+                "validation_report": "No se generó ningún archivo.",
+                "messages": [AIMessage(content="Validación: sin archivos", name="Validator")]}
+
+    _log(f"[validation_gate] Validando {len(applied_files)} archivos (stack={stack})...")
+    passed, report = _validate_workspace(workspace, applied_files, stack)
+    verdict = "PASÓ ✓" if passed else "FALLÓ ✗"
+    _log(f"[validation_gate] {verdict}\n{report[:400]}")
+    return {
+        "validation_passed": passed,
+        "validation_report": report,
+        "messages": [AIMessage(content=f"Validación determinista: {verdict}", name="Validator")],
+    }
+
+
 def reviewer_node(state: FleetState) -> dict:
     """Evalua si los archivos escritos en el workspace cumplen los criterios de aceptacion."""
     workspace      = state["workspace_path"]
@@ -448,6 +785,17 @@ def reviewer_node(state: FleetState) -> dict:
         logger.warning("Reviewer fast-reject: el desarrollador no generó ningún archivo en esta iteración.")
         return {
             "reviewer_feedback": "El desarrollador no generó ningún archivo con el formato FILE_BEGIN/END. Debes usar EXACTAMENTE el formato especificado y escribir TODOS los archivos del servicio.",
+            "is_approved": False,
+        }
+
+    # Gate determinista primero: si el código no parsea / los tests fallan, NO se
+    # gasta el LLM — se devuelven los errores reales para que el dev los corrija.
+    if not state.get("validation_passed", False):
+        report = state.get("validation_report", "(sin reporte)")
+        _log("[quality_reviewer] RECHAZO por validación determinista (errores reales devueltos al dev)")
+        return {
+            "reviewer_feedback": ("La validación determinista FALLÓ. Corrige EXACTAMENTE estos errores "
+                                  "antes de cualquier otra cosa:\n\n" + report),
             "is_approved": False,
         }
 
@@ -469,8 +817,10 @@ def reviewer_node(state: FleetState) -> dict:
     human_prompt = HumanMessage(
         content=(
             f"CRITERIOS DE ACEPTACION:\n{criteria}\n\n"
+            f"VALIDACION DETERMINISTA (ya pasó: sintaxis/tests):\n{state.get('validation_report', '(n/a)')[:1500]}\n\n"
             f"ARCHIVOS ESCRITOS AL DISCO:\n{files_content}\n\n"
-            "Emite tu dictamen en JSON."
+            "Los tests ya pasan. Evalúa si la solución CUMPLE SEMÁNTICAMENTE los criterios "
+            "(no solo que compile). Emite tu dictamen en JSON."
         )
     )
 
@@ -491,22 +841,94 @@ def reviewer_node(state: FleetState) -> dict:
     }
 
 
+def git_finalize_node(state: FleetState) -> dict:
+    """GitFlow: commitea el trabajo en la rama del ticket, hace push y abre PR.
+
+    NUNCA mergea a main: deja el trabajo en una rama + PR para revisión humana.
+    Aprobado o no, el código vive aislado en su rama (revertible). Si la validación
+    no pasó, igual commitea para inspección manual pero marca el PR/commit como WIP.
+    """
+    workspace = state["workspace_path"]
+    ticket    = state["ticket_id"]
+    branch    = state.get("work_branch", "")
+    approved  = state.get("is_approved", False) and state.get("validation_passed", False)
+    applied   = state.get("applied_files", [])
+
+    if not branch or not _is_git_repo(workspace):
+        _log("[git_finalize] Sin rama de trabajo (modo sin-git); se omite commit/PR")
+        return {"pr_url": "", "messages": [AIMessage(content="git omitido", name="GitOps")]}
+
+    if not applied:
+        _log("[git_finalize] No hay archivos que commitear")
+        return {"pr_url": "", "messages": [AIMessage(content="nada que commitear", name="GitOps")]}
+
+    status = "" if approved else "[WIP] "
+    title  = state.get("acceptance_criteria", "").split("\n")[0].replace("TITULO:", "").strip()[:72]
+    body   = (f"{status}{ticket}: {title}\n\n"
+              f"Generado por la Flota de Agentes.\n"
+              f"Ciclos: {state.get('loop_iterations', 0)} · Archivos: {len(applied)} · "
+              f"Validación: {'PASÓ' if state.get('validation_passed') else 'FALLÓ'} · "
+              f"Revisor: {'APROBÓ' if state.get('is_approved') else 'RECHAZÓ'}\n\n"
+              f"Resumen revisor:\n{state.get('reviewer_feedback', '')[:500]}\n\n"
+              f"Ticket: {ticket}")
+
+    _git(["add", "-A"], workspace)
+    rc, out = _git(["commit", "-m", body], workspace)
+    if rc != 0 and "nothing to commit" not in out.lower():
+        _log(f"[git_finalize] commit falló: {out.strip()[:160]}")
+        return {"pr_url": "", "messages": [AIMessage(content=f"commit falló: {out.strip()[:120]}", name="GitOps")]}
+    _log(f"[git_finalize] Commit en {branch} ({len(applied)} archivos)")
+
+    rc, out = _git(["push", "-u", "origin", branch], workspace, timeout=180)
+    if rc != 0:
+        _log(f"[git_finalize] push falló (¿sin remoto/credenciales?): {out.strip()[:160]}")
+        return {"pr_url": "", "messages": [AIMessage(content=f"push falló: {out.strip()[:120]}", name="GitOps")]}
+
+    # PR vía gh CLI si está disponible; si no, deja la rama empujada (PR manual).
+    pr_url = ""
+    if _tool_available("gh"):
+        base = state.get("base_branch", "main") or "main"
+        rc, out = _run(["gh", "pr", "create", "--base", base, "--head", branch,
+                        "--title", f"{status}{ticket}: {title}", "--body", body],
+                       cwd=workspace, timeout=120)
+        m = _re.search(r"https?://\S+/pull/\d+", out)
+        if m:
+            pr_url = m.group(0)
+            _log(f"[git_finalize] PR abierto: {pr_url}")
+        else:
+            _log(f"[git_finalize] gh pr create sin URL: {out.strip()[:160]}")
+    else:
+        _log(f"[git_finalize] gh no disponible; rama '{branch}' empujada (abre el PR manualmente)")
+
+    return {"pr_url": pr_url, "messages": [AIMessage(content=f"Rama {branch} empujada{' · PR ' + pr_url if pr_url else ''}", name="GitOps")]}
+
+
 def finalize_and_update_jira(state: FleetState) -> dict:
     ticket_id    = state["ticket_id"]
     feedback     = state["reviewer_feedback"]
     iterations   = state["loop_iterations"]
     applied      = state.get("applied_files", [])
     is_approved  = state.get("is_approved", False)
+    val_passed   = state.get("validation_passed", False)
+    pr_url       = state.get("pr_url", "")
+    branch       = state.get("work_branch", "")
+    # "Hecho" SOLO si validación determinista pasó Y el revisor aprobó. Si no, va a
+    # revisión humana (nunca se marca como terminado código que no pasó los tests).
+    done = is_approved and val_passed
     status_parts = []
 
-    result_label = "APROBADO" if is_approved else f"AGOTADO (max ciclos={iterations})"
+    result_label = "APROBADO+VALIDADO" if done else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, max ciclos={iterations})"
     _log(f"[jira_updater] Finalizando — resultado: {result_label}")
 
     comment = (
         f"Implementacion procesada por la Flota de Agentes\n\n"
         f"Ciclos de revision: {iterations}\n"
-        f"Archivos modificados: {len(applied)}\n\n"
-        f"Resultado del revisor:\n{feedback}"
+        f"Archivos modificados: {len(applied)}\n"
+        f"Validación determinista (sintaxis/tests): {'PASÓ ✓' if val_passed else 'FALLÓ ✗'}\n"
+        f"Revisor semántico: {'APROBÓ ✓' if is_approved else 'RECHAZÓ ✗'}\n"
+        + (f"Rama: {branch}\n" if branch else "")
+        + (f"Pull Request: {pr_url}\n" if pr_url else "")
+        + f"\nResultado del revisor:\n{feedback}"
     )
     _log(f"[jira_updater] Añadiendo comentario en {ticket_id}...")
     try:
@@ -521,7 +943,12 @@ def finalize_and_update_jira(state: FleetState) -> dict:
     _log(f"[jira_updater] Buscando transición de estado...")
     try:
         transitions     = jira_client.get_issue_transitions(ticket_id)
-        target_keywords = ["done", "resolved", "in review", "closed", "hecho", "resuelto", "finalizado", "en revisión"]
+        # Aprobado+validado → estados terminales/review; si no → solo a "en revisión"
+        # (jamás marcar como hecho código que no pasó los tests).
+        if done:
+            target_keywords = ["in review", "en revisión", "done", "resolved", "closed", "hecho", "resuelto", "finalizado"]
+        else:
+            target_keywords = ["in review", "en revisión", "revisión"]
         for transition in transitions:
             to_value    = transition.get("to", "")
             target_name = (to_value if isinstance(to_value, str) else to_value.get("name", "")).lower()
@@ -577,8 +1004,11 @@ def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied
 # 7. Enrutador condicional (quality gate)
 # ===========================================================================
 def quality_gate_router(state: FleetState) -> str:
-    if state["loop_iterations"] >= 6 or state["is_approved"]:
-        return "jira_updater"
+    """Avanza a finalizar SOLO si validación determinista pasó Y el revisor aprobó.
+    Si no, reitera el ciclo dev→validación→review hasta agotar 6 ciclos."""
+    approved = state.get("is_approved", False) and state.get("validation_passed", False)
+    if state["loop_iterations"] >= 6 or approved:
+        return "git_finalize"
     return "dynamic_developer"
 
 
@@ -588,18 +1018,26 @@ def quality_gate_router(state: FleetState) -> str:
 def build_architecture() -> StateGraph:
     graph = StateGraph(FleetState)
     graph.add_node("context_ingestion", fetch_and_plan_node)
+    graph.add_node("git_setup",         git_setup_node)
+    graph.add_node("planner",           planner_node)
     graph.add_node("dynamic_developer", dynamic_developer_node)
+    graph.add_node("validation_gate",   validation_gate_node)
     graph.add_node("quality_reviewer",  reviewer_node)
+    graph.add_node("git_finalize",      git_finalize_node)
     graph.add_node("jira_updater",      finalize_and_update_jira)
 
     graph.add_edge(START, "context_ingestion")
-    graph.add_edge("context_ingestion", "dynamic_developer")
-    graph.add_edge("dynamic_developer", "quality_reviewer")
+    graph.add_edge("context_ingestion", "git_setup")
+    graph.add_edge("git_setup", "planner")
+    graph.add_edge("planner", "dynamic_developer")
+    graph.add_edge("dynamic_developer", "validation_gate")   # ejecuta el código
+    graph.add_edge("validation_gate", "quality_reviewer")    # luego juicio semántico
     graph.add_conditional_edges(
         "quality_reviewer",
         quality_gate_router,
-        {"dynamic_developer": "dynamic_developer", "jira_updater": "jira_updater"},
+        {"dynamic_developer": "dynamic_developer", "git_finalize": "git_finalize"},
     )
+    graph.add_edge("git_finalize", "jira_updater")
     graph.add_edge("jira_updater", END)
     return graph.compile()
 
@@ -626,6 +1064,13 @@ if __name__ == "__main__":
         "reviewer_feedback":   "",
         "is_approved":         False,
         "loop_iterations":     0,
+        "stack":               "",
+        "base_branch":         "",
+        "work_branch":         "",
+        "subtasks":            [],
+        "validation_report":   "",
+        "validation_passed":   False,
+        "pr_url":              "",
     }
 
     print(f"\nIniciando flota para ticket: {args.ticket}")

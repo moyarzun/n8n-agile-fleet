@@ -412,6 +412,13 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
             "reviewer_feedback": "",
             "is_approved": False,
             "loop_iterations": 0,
+            "stack": "",
+            "base_branch": "",
+            "work_branch": "",
+            "subtasks": [],
+            "validation_report": "",
+            "validation_passed": False,
+            "pr_url": "",
         }
         final_state: dict = dict(initial)
 

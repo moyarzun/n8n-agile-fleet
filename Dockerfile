@@ -2,6 +2,8 @@
 FROM node:22-alpine
 
 # Herramientas de sistema necesarias para compilar dependencias nativas de Python
+# + git (GitFlow: ramas/commits/PR por ticket) y ruby (validación determinista de
+#   sintaxis `ruby -c` sobre el código generado; evita aprobar código que no parsea).
 RUN apk add --update --no-cache \
     python3 \
     py3-pip \
@@ -9,7 +11,9 @@ RUN apk add --update --no-cache \
     python3-dev \
     libffi-dev \
     openssl-dev \
-    curl
+    curl \
+    git \
+    ruby
 
 # n8n instalado globalmente (misma versión que la imagen oficial)
 RUN npm install -g n8n@latest
