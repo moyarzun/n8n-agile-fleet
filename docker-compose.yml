@@ -18,6 +18,7 @@ services:
       - n8n_data:/home/node/.n8n
       - ./agile_scripts:/data/scripts
       - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+      - ${PROJECTS_DIR:-..}:/projects
     depends_on:
       fleet-api:
         condition: service_healthy
@@ -41,9 +42,15 @@ services:
       - JIRA_USER=${JIRA_USER}
       - JIRA_API_TOKEN=${JIRA_API_TOKEN}
       - FLEET_DB=/data/n8n_store/fleet.db
+      # Comando de validación determinista del proyecto (corre la suite real).
+      - FLEET_VALIDATE_CMD=${FLEET_VALIDATE_CMD:-}
+      - FLEET_VALIDATE_TIMEOUT=${FLEET_VALIDATE_TIMEOUT:-600}
     volumes:
       - ./agile_scripts:/data/scripts
       - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+      # Raíz de proyectos de Claude → cualquier proyecto reachable en /projects/<Nombre>
+      # (modo requerimiento libre /solve). Default: el padre de n8n.
+      - ${PROJECTS_DIR:-..}:/projects
       - n8n_data:/data/n8n_store
     working_dir: /data/scripts
     command: ["uvicorn", "fleet_api:app", "--host", "0.0.0.0", "--port", "8000"]

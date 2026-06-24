@@ -92,6 +92,37 @@ Codificadas en `ENGINEERING_GUARDRAILS` (langgraph_fleet.py). Resumen:
 - `push -u origin` + `gh pr create --base <base>` → URL del PR en el comentario de Jira.
 - **Jamás** merge automático a `main`. Revisión humana del PR.
 
+## 6b. Modo requerimiento libre — cualquier proyecto, sin Jira
+
+La Flota resuelve **cualquier requerimiento de código en cualquier proyecto de Claude**,
+no solo tarjetas de Jira. Jira es ahora **opcional** (el cliente se inicializa sólo si
+hay credenciales; los nodos de Jira se saltan si no).
+
+**Montaje:** la raíz de proyectos se monta en `/projects` (`PROJECTS_DIR`, default el
+padre de `n8n/`). Cualquier proyecto es alcanzable como `/projects/<Nombre>`.
+
+**Entradas equivalentes (mismo pipeline v2):**
+
+| Vía | Cómo |
+|---|---|
+| **MCP** (Claude Code) | herramienta `resolver_requerimiento(requerimiento, proyecto, agentes?)` |
+| **HTTP** | `POST /solve` `{ "requirement": "...", "workspace": "/projects/<Nombre>", "agents": ["Rails"] }` |
+| **CLI** | `python langgraph_fleet.py --requirement "..." --workspace /projects/<Nombre> --agents Rails,Schema` |
+| Jira (compat) | `resolver_ticket_jira(ticket_id)` · `POST /run` · `--ticket` |
+
+En modo libre se genera un id sintético `TASK-<hex>`, se crea la rama
+`fleet/TASK-<hex>-<slug>`, se implementa+valida y se abre PR. El **entregable es el
+PR** (no hay ticket que actualizar). Todo lo demás (grounding, gate determinista,
+guardrails, GitFlow) es idéntico.
+
+```bash
+# Ejemplo HTTP (síncrono con X-Wait)
+curl -s -X POST http://localhost:8000/solve -H "Content-Type: application/json" \
+  -H "X-Wait: true" \
+  -d '{"requirement":"Agrega validación de RUT chileno al modelo Usuario con su spec",
+       "workspace":"/projects/obra_viva","agents":["Rails"]}'
+```
+
 ## 7. Cómo aplicar / desplegar
 
 ```bash

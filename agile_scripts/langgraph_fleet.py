@@ -232,12 +232,19 @@ def _invoke_reviewer_structured(messages: list) -> "ReviewerDecision":
     return ReviewerDecision(**_json.loads(_extract_json(content)))
 
 
-jira_client = Jira(
-    url=JIRA_URL,
-    username=JIRA_USERNAME,
-    password=JIRA_API_TOKEN,
-    cloud=True,
-)
+def _make_jira_client():
+    """Cliente Jira opcional: la Flota también resuelve requerimientos libres sin Jira."""
+    if not (JIRA_URL and JIRA_USERNAME and JIRA_API_TOKEN):
+        logger.info("Jira no configurado — modo requerimiento libre disponible (sin Jira).")
+        return None
+    try:
+        return Jira(url=JIRA_URL, username=JIRA_USERNAME, password=JIRA_API_TOKEN, cloud=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudo inicializar Jira (%s) — solo modo requerimiento libre.", e)
+        return None
+
+
+jira_client = _make_jira_client()
 
 # ===========================================================================
 # 2. Helpers de workspace real
@@ -475,6 +482,7 @@ def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tupl
 class FleetState(TypedDict):
     messages:            Annotated[List[BaseMessage], add_messages]
     ticket_id:           str
+    requirement:         str         # requerimiento libre (sin Jira); si está, ignora ticket_id
     workspace_path:      str
     acceptance_criteria: str
     required_agents:     List[str]
@@ -502,18 +510,31 @@ class ReviewerDecision(BaseModel):
 # 4. Nodos del grafo
 # ===========================================================================
 def fetch_and_plan_node(state: FleetState) -> dict:
-    ticket_id   = state["ticket_id"]
-    _log(f"[context_ingestion] Leyendo ticket {ticket_id} desde Jira...")
-    issue_data  = jira_client.issue(ticket_id)
-    summary     = issue_data["fields"]["summary"]
-    description = issue_data["fields"]["description"] or ""
-    labels      = issue_data["fields"].get("labels", [])
+    ticket_id   = state.get("ticket_id", "")
+    requirement = (state.get("requirement") or "").strip()
+    preset_agents = state.get("required_agents") or []
 
-    _log(f"[context_ingestion] Ticket: {summary}")
-
-    required_agents = [lbl.split(":")[1] for lbl in labels if lbl.startswith("agent:")]
-    if not required_agents:
-        required_agents = ["Full-Stack"]
+    if requirement:
+        # ── Modo requerimiento libre: cualquier proyecto, sin Jira ──────────────
+        summary     = requirement.split("\n", 1)[0][:120]
+        description = requirement
+        _log(f"[context_ingestion] Modo requerimiento libre: {summary}")
+        required_agents = preset_agents or ["Full-Stack"]
+    elif jira_client is not None:
+        # ── Modo Jira (compatibilidad) ──────────────────────────────────────────
+        _log(f"[context_ingestion] Leyendo ticket {ticket_id} desde Jira...")
+        issue_data  = jira_client.issue(ticket_id)
+        summary     = issue_data["fields"]["summary"]
+        description = issue_data["fields"]["description"] or ""
+        labels      = issue_data["fields"].get("labels", [])
+        _log(f"[context_ingestion] Ticket: {summary}")
+        required_agents = [lbl.split(":")[1] for lbl in labels if lbl.startswith("agent:")]
+        required_agents = required_agents or preset_agents or ["Full-Stack"]
+    else:
+        raise RuntimeError(
+            "Sin 'requirement' ni Jira configurado. Provee un requerimiento libre "
+            "o configura JIRA_URL/JIRA_USER/JIRA_API_TOKEN."
+        )
 
     _log(f"[context_ingestion] Agentes asignados: {required_agents}")
     desc_preview = (description[:120] + "...") if len(description) > 120 else description
@@ -920,6 +941,15 @@ def finalize_and_update_jira(state: FleetState) -> dict:
     result_label = "APROBADO+VALIDADO" if done else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, max ciclos={iterations})"
     _log(f"[jira_updater] Finalizando — resultado: {result_label}")
 
+    # Modo requerimiento libre (sin Jira): el entregable es la rama + PR; no hay
+    # ticket que comentar/transicionar.
+    if (state.get("requirement") or "").strip() or jira_client is None:
+        msg = (f"Finalizado ({result_label}). "
+               + (f"PR: {pr_url}" if pr_url else (f"Rama: {branch}" if branch else "sin git"))
+               + " · (sin Jira)")
+        _log(f"[jira_updater] {msg}")
+        return {"messages": [AIMessage(content=msg, name="Done")]}
+
     comment = (
         f"Implementacion procesada por la Flota de Agentes\n\n"
         f"Ciclos de revision: {iterations}\n"
@@ -971,7 +1001,11 @@ def finalize_and_update_jira(state: FleetState) -> dict:
 # 5. Parada grácil iniciada por el usuario
 # ===========================================================================
 def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied_files: list) -> None:
-    """Comenta el estado actual en Jira y transiciona el ticket a Bloqueado."""
+    """Comenta el estado actual en Jira y transiciona el ticket a Bloqueado.
+    No-op si no hay Jira (modo requerimiento libre)."""
+    if jira_client is None:
+        logger.info("stop_gracefully: sin Jira; nada que actualizar.")
+        return
     files_list = "\n".join(f"  - {f}" for f in applied_files) if applied_files else "  (ninguno)"
     comment = (
         f"⚠️ *Ejecución detenida por el usuario.*\n\n"
@@ -1046,19 +1080,25 @@ def build_architecture() -> StateGraph:
 # 9. Entrypoint — invocado por fleet_api.py o directo via CLI
 # ===========================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Flota multi-agente LangGraph para tickets de Jira")
-    parser.add_argument("--ticket",    required=True, help="ID del ticket de Jira (ej. SCRUM-28)")
-    parser.add_argument("--workspace", required=True, help="Ruta al directorio del proyecto")
+    parser = argparse.ArgumentParser(description="Flota multi-agente LangGraph (Jira o requerimiento libre)")
+    parser.add_argument("--ticket",      help="ID del ticket de Jira (ej. SCRUM-28)")
+    parser.add_argument("--requirement", help="Requerimiento libre en texto (sin Jira). Cualquier proyecto.")
+    parser.add_argument("--workspace",   required=True, help="Ruta al directorio del proyecto")
+    parser.add_argument("--agents",      default="", help="Roles separados por coma (ej. Rails,Schema)")
     args = parser.parse_args()
+
+    if not args.ticket and not args.requirement:
+        parser.error("Debes indicar --ticket o --requirement")
 
     logging.basicConfig(level=logging.INFO)
     engine = build_architecture()
     initial_payload: FleetState = {
         "messages":            [],
-        "ticket_id":           args.ticket,
+        "ticket_id":           args.ticket or f"TASK-{os.urandom(4).hex()}",
+        "requirement":         args.requirement or "",
         "workspace_path":      args.workspace,
         "acceptance_criteria": "",
-        "required_agents":     [],
+        "required_agents":     [a.strip() for a in args.agents.split(",") if a.strip()],
         "current_code_diff":   {},
         "applied_files":       [],
         "reviewer_feedback":   "",
@@ -1073,7 +1113,7 @@ if __name__ == "__main__":
         "pr_url":              "",
     }
 
-    print(f"\nIniciando flota para ticket: {args.ticket}")
+    print(f"\nIniciando flota para: {args.ticket or args.requirement[:60]}")
     for step_event in engine.stream(initial_payload, stream_mode="updates"):
         for node_name, data in step_event.items():
             if data.get("messages"):

@@ -28,6 +28,14 @@ class TicketRequest(BaseModel):
     workspace: str = "/workspace"
 
 
+class TaskRequest(BaseModel):
+    """Requerimiento libre (sin Jira) para CUALQUIER proyecto montado en el contenedor."""
+    requirement: str                          # qué se debe construir/arreglar
+    workspace: str = "/workspace"             # ruta del proyecto dentro del contenedor
+    agents: Optional[List[str]] = None        # roles (ej. ["Rails","Schema"]); default Full-Stack
+    base_branch: Optional[str] = None         # rama base para el PR (default: develop/main del repo)
+
+
 class FleetResponse(BaseModel):
     ticket_id: str
     approved: bool
@@ -353,8 +361,13 @@ async def _cleanup_loop() -> None:
 # Worker — corre en ThreadPoolExecutor
 # ---------------------------------------------------------------------------
 
-def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: threading.Event) -> dict:
-    """Ejecuta engine.stream() sincrónicamente. Actualiza _jobs y emite eventos SSE."""
+def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: threading.Event,
+                      requirement: str = "", agents: Optional[List[str]] = None) -> dict:
+    """Ejecuta engine.stream() sincrónicamente. Actualiza _jobs y emite eventos SSE.
+
+    Dos modos: ticket de Jira (ticket_id real) o requerimiento libre (requirement),
+    este último para cualquier proyecto sin Jira.
+    """
     job = _jobs[job_id]
     job.status = "running"
 
@@ -404,9 +417,10 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
         initial: FleetState = {
             "messages": [],
             "ticket_id": ticket_id,
+            "requirement": requirement or "",
             "workspace_path": workspace,
             "acceptance_criteria": "",
-            "required_agents": [],
+            "required_agents": agents or [],
             "current_code_diff": {},
             "applied_files": [],
             "reviewer_feedback": "",
@@ -548,6 +562,49 @@ async def run_fleet(req: TicketRequest, request: Request):
 
     asyncio.create_task(_fire_and_forget())
     return {"job_id": job_id, "ticket_id": req.ticket_id}
+
+
+@app.post("/solve")
+async def solve_task(req: TaskRequest, request: Request):
+    """Resuelve un requerimiento de código libre en CUALQUIER proyecto (sin Jira).
+
+    Reutiliza el pipeline v2 completo (grounding, validación determinista, GitFlow):
+    crea una rama fleet/TASK-<id>-<slug>, implementa, valida y abre PR. El job_id se
+    expone igual que en /run para seguir el progreso por SSE/status.
+    """
+    if not req.requirement.strip():
+        raise HTTPException(status_code=422, detail="'requirement' no puede estar vacío")
+
+    task_id = "TASK-" + uuid.uuid4().hex[:8]
+    wait    = request.headers.get("X-Wait", "").lower() in ("true", "1")
+    job_id  = str(uuid.uuid4())
+    job = JobState(job_id=job_id, ticket_id=task_id)
+    _jobs[job_id] = job
+    _persist_job(job)
+    stop_flag = threading.Event()
+    _stop_flags[job_id] = stop_flag
+
+    loop = asyncio.get_running_loop()
+    if wait:
+        result = await loop.run_in_executor(
+            _wait_executor, _run_fleet_worker, job_id, task_id, req.workspace, stop_flag,
+            req.requirement, req.agents,
+        )
+        return FleetResponse(
+            ticket_id=task_id,
+            approved=result["approved"],
+            iterations=result["iterations"],
+            summary=result["summary"],
+        )
+
+    async def _fire_and_forget() -> None:
+        await loop.run_in_executor(
+            _async_executor, _run_fleet_worker, job_id, task_id, req.workspace, stop_flag,
+            req.requirement, req.agents,
+        )
+
+    asyncio.create_task(_fire_and_forget())
+    return {"job_id": job_id, "task_id": task_id}
 
 
 @app.post("/stop/{job_id}")
