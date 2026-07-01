@@ -19,6 +19,7 @@ services:
       - ./agile_scripts:/data/scripts
       - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
       - ${PROJECTS_DIR:-..}:/projects
+      - ${VAULTS_DIR:-/Users/moyarzun/vaults}:/vaults
     depends_on:
       fleet-api:
         condition: service_healthy
@@ -45,12 +46,15 @@ services:
       # Comando de validación determinista del proyecto (corre la suite real).
       - FLEET_VALIDATE_CMD=${FLEET_VALIDATE_CMD:-}
       - FLEET_VALIDATE_TIMEOUT=${FLEET_VALIDATE_TIMEOUT:-600}
+      # Permite operar repos montados desde el host (distintos owners de UID)
+      - GIT_CONFIG_GLOBAL=/root/.gitconfig
     volumes:
       - ./agile_scripts:/data/scripts
       - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
       # Raíz de proyectos de Claude → cualquier proyecto reachable en /projects/<Nombre>
       # (modo requerimiento libre /solve). Default: el padre de n8n.
       - ${PROJECTS_DIR:-..}:/projects
+      - ${VAULTS_DIR:-/Users/moyarzun/vaults}:/vaults
       - n8n_data:/data/n8n_store
     working_dir: /data/scripts
     command: ["uvicorn", "fleet_api:app", "--host", "0.0.0.0", "--port", "8000"]

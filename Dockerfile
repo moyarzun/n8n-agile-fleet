@@ -13,7 +13,9 @@ RUN apk add --update --no-cache \
     openssl-dev \
     curl \
     git \
-    ruby
+    ruby \
+    rust \
+    cargo
 
 # n8n instalado globalmente (misma versión que la imagen oficial)
 RUN npm install -g n8n@latest
