@@ -182,6 +182,18 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 - Un cambio NO está terminado hasta que `npx vitest run` pasa con los nuevos tests incluidos.
 - No uses placeholders en tests ('// TODO: test this'). Los tests deben ser reales y ejecutables.
 
+[VERCEL: feature flags y rutas de staging]
+- Para rutas o comportamiento que solo debe existir en Vercel Preview (staging), usa
+  `process.env.VERCEL_ENV === "preview"` en lugar de variables custom como E2E_TEST_MODE.
+  Vercel inyecta VERCEL_ENV automáticamente ("production" / "preview" / "development") sin
+  configuración adicional. Las variables custom añadidas con `vercel env add` se guardan como
+  Sensitive/Encrypted por defecto y pueden no llegar al runtime.
+- Si creas endpoints o comportamiento gated por environment, verifica el check en TODOS los
+  puntos de entrada: route handler, middleware, auth helpers, server context. Un check suelto
+  en un solo lugar no es suficiente.
+- Todo API route nuevo que dependa de server-side logic debe tener `export const dynamic =
+  "force-dynamic"` para evitar que Next.js lo prerenderice como estático en el build.
+
 [NO ROMPAS EL BUILD]
 - No importes paquetes que no estén en package.json.
 - No cambies next.config.mjs ni tsconfig.json sin necesidad.
@@ -1403,7 +1415,28 @@ def staging_tester_node(state: FleetState) -> dict:
 
     report.append(f"STAGING TEST → {staging_url}\n")
 
-    # ── 2. Smoke tests de API (curl, sin autenticación) ─────────────────────
+    # ── 2. Migraciones de DB en staging (stack node con Prisma) ────────────
+    # Se aplican ANTES de los smoke tests para que la DB esté al día.
+    staging_env_file = os.path.join(workspace, ".env.staging")
+    prisma_bin = os.path.join(workspace, "node_modules", ".bin", "prisma")
+    if (
+        state.get("stack") == "node"
+        and os.path.exists(staging_env_file)
+        and os.path.exists(prisma_bin)
+    ):
+        _log("[staging_tester] aplicando migraciones en staging DB…")
+        rc_mig, out_mig = _run(
+            ["node", "--env-file=.env.staging", prisma_bin, "migrate", "deploy"],
+            cwd=workspace,
+            timeout=120,
+        )
+        if rc_mig == 0:
+            report.append("  ✓ Migraciones staging DB: aplicadas correctamente")
+        else:
+            report.append(f"  ✗ Migraciones staging DB: falló (exit {rc_mig})\n{out_mig[-300:]}")
+            ok = False
+
+    # ── 3. Smoke tests de API (curl, sin autenticación) ─────────────────────
     smoke_checks = [
         ("/",                                     ["200", "301", "302"], "home"),
         ("/api/mobile/admin/support-data",        ["401", "307", "403"], "support-data (sin auth)"),
@@ -1425,7 +1458,7 @@ def staging_tester_node(state: FleetState) -> dict:
             report.append(f"  ✗ {label}: esperaba {expected_codes}, obtuvo '{code}'")
             ok = False
 
-    # ── 3. Playwright E2E contra la URL de staging ──────────────────────────
+    # ── 4. Playwright E2E contra la URL de staging ──────────────────────────
     e2e_dir = os.path.join(workspace, "tests", "e2e")
     playwright_bin = os.path.join(workspace, "node_modules", ".bin", "playwright")
     if os.path.isdir(e2e_dir) and os.path.exists(playwright_bin):
