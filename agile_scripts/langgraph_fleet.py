@@ -696,6 +696,10 @@ class FleetState(TypedDict):
     pr_url:              str         # URL del PR si se abrió
     existing_files:      Dict[str, str]  # contenido de archivos existentes antes de modificar
     regression_errors:   List[str]       # elementos eliminados detectados por regression_guard
+    # ── Staging tester ──
+    staging_url:         str         # URL del deploy de staging (Vercel preview o STAGING_BASE_URL)
+    staging_passed:      bool        # True si los smoke/E2E de staging pasaron (o si staging no está configurado)
+    staging_report:      str         # salida del staging_tester_node
 
 
 class ReviewerDecision(BaseModel):
@@ -1356,6 +1360,109 @@ def git_finalize_node(state: FleetState) -> dict:
     return {"pr_url": pr_url, "messages": [AIMessage(content=f"Rama {branch} empujada{' · PR ' + pr_url if pr_url else ''}", name="GitOps")]}
 
 
+def staging_tester_node(state: FleetState) -> dict:
+    """Smoke tests + E2E contra staging. No-op si no hay URL configurada."""
+    workspace = state.get("workspace_path", "")
+    report: list[str] = []
+    ok = True
+
+    # ── 1. Determinar la URL de staging ────────────────────────────────────
+    staging_url = os.getenv("STAGING_BASE_URL", "").strip()
+
+    if not staging_url:
+        # Intentar deploy automático a Vercel si el proyecto tiene .vercel/project.json
+        vercel_cfg = os.path.join(workspace, ".vercel", "project.json")
+        if os.path.exists(vercel_cfg) and _tool_available("vercel"):
+            _log("[staging_tester] .vercel/project.json detectado — desplegando a staging…")
+            rc, out = _run(
+                ["vercel", "deploy", "--target", "staging", "--yes", "--no-wait"],
+                cwd=workspace, timeout=int(os.getenv("FLEET_STAGING_DEPLOY_TIMEOUT", "300")),
+            )
+            if rc == 0:
+                m = _re.search(r'https://[^\s]+\.vercel\.app', out)
+                if m:
+                    staging_url = m.group(0).strip()
+                    _log(f"[staging_tester] preview URL: {staging_url}")
+            else:
+                report.append(f"STAGING DEPLOY: ✗ vercel deploy falló (exit {rc})\n{out[-500:]}")
+                ok = False
+
+    if not staging_url:
+        msg = (
+            "STAGING: ⚠ URL no configurada — se omite el test de staging.\n"
+            "  Para activarlo: define STAGING_BASE_URL=<url> en .env\n"
+            "  o asegúrate de que .vercel/project.json exista y `vercel` CLI esté instalado."
+        )
+        _log(f"[staging_tester] {msg}")
+        return {
+            "staging_url":    "",
+            "staging_passed": True,   # No bloqueamos si staging no está configurado
+            "staging_report": msg,
+            "messages": [AIMessage(content="staging omitido — URL no configurada", name="StagingTester")],
+        }
+
+    report.append(f"STAGING TEST → {staging_url}\n")
+
+    # ── 2. Smoke tests de API (curl, sin autenticación) ─────────────────────
+    smoke_checks = [
+        ("/",                                     ["200", "301", "302"], "home"),
+        ("/api/mobile/admin/support-data",        ["401", "307", "403"], "support-data (sin auth)"),
+    ]
+    if state.get("stack") == "node":
+        smoke_checks.append(("/api/health", ["200", "404"], "health endpoint"))
+
+    for path, expected_codes, label in smoke_checks:
+        url = staging_url.rstrip("/") + path
+        rc, out = _run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--connect-timeout", "10", "--max-time", "15", "-L", url],
+            cwd="/", timeout=20,
+        )
+        code = out.strip()
+        if code in expected_codes:
+            report.append(f"  ✓ {label}: HTTP {code}")
+        else:
+            report.append(f"  ✗ {label}: esperaba {expected_codes}, obtuvo '{code}'")
+            ok = False
+
+    # ── 3. Playwright E2E contra la URL de staging ──────────────────────────
+    e2e_dir = os.path.join(workspace, "tests", "e2e")
+    playwright_bin = os.path.join(workspace, "node_modules", ".bin", "playwright")
+    if os.path.isdir(e2e_dir) and os.path.exists(playwright_bin):
+        _log(f"[staging_tester] ejecutando E2E de Playwright contra {staging_url}")
+        env_with_url = {**os.environ, "PLAYWRIGHT_BASE_URL": staging_url}
+        try:
+            p = subprocess.run(
+                ["node", playwright_bin, "test", "--reporter=list", "--project=chromium"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("FLEET_STAGING_E2E_TIMEOUT", "300")),
+                env=env_with_url,
+            )
+            tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-30:])
+            if p.returncode == 0:
+                report.append(f"  ✓ Playwright E2E: todos los tests pasan\n{tail}")
+            else:
+                report.append(f"  ✗ Playwright E2E: tests fallando (exit {p.returncode})\n{tail}")
+                ok = False
+        except subprocess.TimeoutExpired:
+            report.append("  ✗ Playwright E2E: TIMEOUT — los tests tardaron demasiado")
+            ok = False
+    else:
+        report.append("  ⚠ Playwright E2E: omitido (playwright no instalado en node_modules o sin tests/e2e/)")
+
+    full_report = "\n".join(report)
+    verdict = "✓ STAGING PASÓ" if ok else "✗ STAGING FALLÓ"
+    _log(f"[staging_tester] {verdict}")
+    return {
+        "staging_url":    staging_url,
+        "staging_passed": ok,
+        "staging_report": full_report,
+        "messages": [AIMessage(content=f"{verdict}\n{full_report}", name="StagingTester")],
+    }
+
+
 def finalize_and_update_jira(state: FleetState) -> dict:
     ticket_id    = state["ticket_id"]
     feedback     = state["reviewer_feedback"]
@@ -1367,10 +1474,16 @@ def finalize_and_update_jira(state: FleetState) -> dict:
     branch       = state.get("work_branch", "")
     # "Hecho" SOLO si validación determinista pasó Y el revisor aprobó. Si no, va a
     # revisión humana (nunca se marca como terminado código que no pasó los tests).
-    done = is_approved and val_passed
+    staging_passed = state.get("staging_passed", True)
+    staging_url    = state.get("staging_url", "")
+    staging_report = state.get("staging_report", "")
+    done = is_approved and val_passed and staging_passed
     status_parts = []
 
-    result_label = "APROBADO+VALIDADO" if done else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, max ciclos={iterations})"
+    result_label = (
+        "APROBADO+VALIDADO+STAGING" if done
+        else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, staging={'ok' if staging_passed else 'falló'}, max ciclos={iterations})"
+    )
     _log(f"[jira_updater] Finalizando — resultado: {result_label}")
 
     # Modo requerimiento libre (sin Jira): el entregable es la rama + PR; no hay
@@ -1388,8 +1501,11 @@ def finalize_and_update_jira(state: FleetState) -> dict:
         f"Archivos modificados: {len(applied)}\n"
         f"Validación determinista (sintaxis/tests): {'PASÓ ✓' if val_passed else 'FALLÓ ✗'}\n"
         f"Revisor semántico: {'APROBÓ ✓' if is_approved else 'RECHAZÓ ✗'}\n"
+        f"Staging tests: {'PASÓ ✓' if staging_passed else 'FALLÓ ✗'}"
+        + (f" — {staging_url}" if staging_url else " (no configurado)") + "\n"
         + (f"Rama: {branch}\n" if branch else "")
         + (f"Pull Request: {pr_url}\n" if pr_url else "")
+        + (f"\nResultado staging:\n{staging_report}\n" if staging_url and not staging_passed else "")
         + f"\nResultado del revisor:\n{feedback}"
     )
     _log(f"[jira_updater] Añadiendo comentario en {ticket_id}...")
@@ -1492,14 +1608,15 @@ def build_architecture() -> StateGraph:
     graph.add_node("validation_gate",    validation_gate_node)
     graph.add_node("quality_reviewer",   reviewer_node)
     graph.add_node("git_finalize",       git_finalize_node)
+    graph.add_node("staging_tester",     staging_tester_node)      # smoke tests + E2E contra staging
     graph.add_node("jira_updater",       finalize_and_update_jira)
 
     graph.add_edge(START, "context_ingestion")
     graph.add_edge("context_ingestion", "git_setup")
     graph.add_edge("git_setup",         "planner")
-    graph.add_edge("planner",           "codebase_reader")         # nuevo: captura archivos existentes
+    graph.add_edge("planner",           "codebase_reader")         # captura archivos existentes
     graph.add_edge("codebase_reader",   "dynamic_developer")
-    graph.add_edge("dynamic_developer", "regression_guard")        # nuevo: verifica antes de tsc
+    graph.add_edge("dynamic_developer", "regression_guard")        # verifica regresiones antes de tsc
     graph.add_edge("regression_guard",  "validation_gate")
     graph.add_edge("validation_gate",   "quality_reviewer")
     graph.add_conditional_edges(
@@ -1507,8 +1624,9 @@ def build_architecture() -> StateGraph:
         quality_gate_router,
         {"dynamic_developer": "dynamic_developer", "git_finalize": "git_finalize"},
     )
-    graph.add_edge("git_finalize", "jira_updater")
-    graph.add_edge("jira_updater", END)
+    graph.add_edge("git_finalize",   "staging_tester")             # deploy + smoke + E2E en staging
+    graph.add_edge("staging_tester", "jira_updater")
+    graph.add_edge("jira_updater",   END)
     return graph.compile()
 
 
@@ -1549,6 +1667,9 @@ if __name__ == "__main__":
         "pr_url":              "",
         "existing_files":      {},
         "regression_errors":   [],
+        "staging_url":         "",
+        "staging_passed":      True,
+        "staging_report":      "",
     }
 
     print(f"\nIniciando flota para: {args.ticket or args.requirement[:60]}")

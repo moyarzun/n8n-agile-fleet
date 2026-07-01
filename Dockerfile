@@ -15,10 +15,16 @@ RUN apk add --update --no-cache \
     git \
     ruby \
     rust \
-    cargo
+    cargo \
+    chromium \
+    chromium-chromedriver
 
-# n8n instalado globalmente (misma versión que la imagen oficial)
-RUN npm install -g n8n@latest
+# Vercel CLI — para deploy automático a staging desde staging_tester_node
+# Playwright usa el chromium del sistema (PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1)
+RUN npm install -g n8n@latest vercel@latest
+
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # Dependencias Python para el motor LangGraph
 COPY requirements.txt /tmp/requirements.txt

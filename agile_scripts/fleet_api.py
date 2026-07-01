@@ -433,6 +433,11 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
             "validation_report": "",
             "validation_passed": False,
             "pr_url": "",
+            "existing_files": {},
+            "regression_errors": [],
+            "staging_url": "",
+            "staging_passed": True,
+            "staging_report": "",
         }
         final_state: dict = dict(initial)
 
