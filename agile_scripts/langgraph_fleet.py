@@ -73,13 +73,14 @@ _minimax_reviewer = ChatOpenAI(
 # ---------------------------------------------------------------------------
 # Fallback OpenRouter — cadena de modelos gratuitos (sin Claude/Anthropic)
 # ---------------------------------------------------------------------------
-def _make_or(model: str, temperature: float) -> ChatOpenAI:
+def _make_or(model: str, temperature: float, timeout: int = 900) -> ChatOpenAI:
     return ChatOpenAI(
         api_key=OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
         model=model,
         temperature=temperature,
         max_tokens=40960,
+        request_timeout=timeout,
         default_headers={
             "HTTP-Referer": "https://veracta.atlassian.net",
             "X-Title": "Veracta LangGraph Fleet",
@@ -87,11 +88,13 @@ def _make_or(model: str, temperature: float) -> ChatOpenAI:
     )
 
 _OR_DEV_CHAIN = [
-    _make_or("qwen/qwen3-coder:free", 0.3),
     _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.3),
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.3),
     _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.3),
 ]
+
+# Para desarrollo: Qwen 3 Coder como modelo primario (mejor seguimiento de formato FILE_BEGIN/END)
+_qwen_dev = _make_or("qwen/qwen3-coder:free", 0.3)
 
 _OR_REVIEWER_CHAIN = [
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.0),
@@ -101,10 +104,9 @@ _OR_REVIEWER_CHAIN = [
 
 
 # ===========================================================================
-# Guardrails de ingeniería — lecciones destiladas de fallos reales en prod.
-# Se inyectan en CADA prompt del desarrollador para no repetir los mismos errores.
+# Guardrails de ingeniería — por stack. Se inyectan en CADA prompt del dev.
 # ===========================================================================
-ENGINEERING_GUARDRAILS = """
+ENGINEERING_GUARDRAILS_RAILS = """
 REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 
 [GROUNDING — la fuente de verdad existe; NO inventes]
@@ -139,6 +141,71 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
   inválida. Si dudas de que una gema/clase exista, NO la uses.
 """.strip()
 
+ENGINEERING_GUARDRAILS_NODE = """
+REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
+
+[STACK — este es un proyecto TypeScript/Next.js + Prisma. NO uses Ruby, Rails ni .rb]
+- Lenguaje: TypeScript (.ts / .tsx). NUNCA generes archivos .rb, .erb, ni Ruby.
+- ORM: Prisma (schema.prisma, prisma/migrations/). NO uses ActiveRecord ni migrate de Rails.
+- Framework web: Next.js 14 App Router (src/app/). NO uses Rails controllers.
+- Mobile: Expo/React Native. Archivos mobile SIEMPRE en mobile/ (ej: mobile/components/PhoneField.tsx,
+  mobile/app/...). NUNCA en src/components/mobile/ ni src/app/mobile/. El tsconfig web excluye
+  mobile/ — si pones código React Native en src/, tsc fallará por imports de react-native.
+
+[GROUNDING — lee el código existente antes de escribir]
+- Antes de crear un componente, busca patrones similares en src/components/.
+- Antes de tocar Prisma, lee prisma/schema.prisma completo para conocer el esquema real.
+- Usa EXACTAMENTE los nombres de campo que existen en el schema. No inventes campos.
+- Verifica los imports existentes en el archivo antes de agregar nuevos.
+
+[PRISMA / MIGRACIONES]
+- Cambios al schema.prisma SIEMPRE van acompañados de su migración SQL en prisma/migrations/.
+- El nombre de la migración: prisma/migrations/<timestamp>_<descripcion>/migration.sql
+- Nunca generes un campo en el schema sin agregar la migración correspondiente.
+
+[TYPESCRIPT — sin esto el trabajo NO está hecho]
+- Todo archivo .ts/.tsx debe compilar sin errores (npx tsc --noEmit).
+- No uses `any` sin justificación. Usa los tipos ya definidos en el proyecto.
+- No uses placeholders ('...', '// TODO', '// rest of implementation') — el archivo va completo.
+- Imports con alias @/ mapean a src/ (configurado en tsconfig.json).
+
+[TDD — metodología obligatoria para todo cambio de código]
+- Escribe los tests ANTES o JUNTO con el código de implementación (Red → Green → Refactor).
+- Todo función pura nueva en src/lib/ o mobile/lib/ DEBE tener su archivo *.test.ts.
+  Ejemplo: si creas src/lib/foo-utils.ts → crea src/lib/foo-utils.test.ts con describe+it.
+- Los tests de unidad van en src/lib/*.test.ts y mobile/lib/*.test.ts (Vitest).
+- Los tests de integración de rutas/actions van también en src/lib/ o src/server/ con Vitest.
+- Los tests E2E de flujos de usuario van en tests/e2e/*.spec.ts (Playwright).
+- Para tests de regresión: cuando modificas código existente, agrega al menos un test que
+  verifique que el comportamiento anterior sigue funcionando.
+- Framework de tests: `vitest` (ya instalado). Importa `{ describe, it, expect } from "vitest"`.
+- Un cambio NO está terminado hasta que `npx vitest run` pasa con los nuevos tests incluidos.
+- No uses placeholders en tests ('// TODO: test this'). Los tests deben ser reales y ejecutables.
+
+[NO ROMPAS EL BUILD]
+- No importes paquetes que no estén en package.json.
+- No cambies next.config.mjs ni tsconfig.json sin necesidad.
+- Los Server Components no pueden tener 'use client' ni usar hooks de React.
+- Los Client Components deben tener 'use client' al inicio si usan useState/useEffect/hooks.
+""".strip()
+
+ENGINEERING_GUARDRAILS_GENERIC = """
+REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
+- Escribe código completo y funcional. Sin placeholders ('...', 'TODO', 'rest of implementation').
+- Respeta el stack y lenguaje del proyecto existente. No introduzcas lenguajes ajenos.
+- Lee los archivos existentes antes de escribir para no romper interfaces ya definidas.
+""".strip()
+
+def _get_guardrails(stack: str) -> str:
+    if stack == "rails":
+        return ENGINEERING_GUARDRAILS_RAILS
+    if stack == "node":
+        return ENGINEERING_GUARDRAILS_NODE
+    return ENGINEERING_GUARDRAILS_GENERIC
+
+# Compatibilidad retroactiva
+ENGINEERING_GUARDRAILS = ENGINEERING_GUARDRAILS_RAILS
+
 # Playbooks por especialidad: refuerzo de rol además de las guardrails comunes.
 ROLE_PLAYBOOKS = {
     "Rails":      "Enfócate en modelo+migración+spec coherentes. enum⇒columna/attribute. TenantRecord para tablas de tenant.",
@@ -147,6 +214,17 @@ ROLE_PLAYBOOKS = {
     "Mobile":     "Flutter/Dart. Respeta el contrato de la API (campos snake_case del backend). No rompas el build (`flutter analyze`).",
     "Flutter":    "Flutter/Dart. Respeta el contrato de la API. Mantén el build verde (`flutter analyze`).",
     "Full-Stack": "Triangula spec↔factory↔esquema antes de codificar. Tras escribir, todo debe parsear y los specs tocados pasar.",
+    "Node":       "Next.js 14 App Router + Prisma + TypeScript. Server Actions para mutaciones. Client Components con 'use client'. npx tsc --noEmit debe pasar.",
+    "TypeScript": "TypeScript estricto. Tipos explícitos. Sin any. Imports con alias @/. Todo debe compilar.",
+    "React":      "Componentes React funcionales con hooks. 'use client' cuando sea necesario. shadcn/ui para UI components.",
+    "QA":         "Experto en calidad de software. Tu tarea es SOLO escribir tests: nunca modifiques el código de implementación. Cubre unit tests (src/lib/*.test.ts), integration tests (server actions y API routes), regression tests (comportamiento previo) y E2E (tests/e2e/*.spec.ts con Playwright). Sigue TDD: Red → Green → Refactor. Usa vitest para unit/integration, Playwright para E2E. Todos los tests deben ser ejecutables y pasar.",
+}
+
+ROLE_PLAYBOOKS_NODE = {
+    "Full-Stack": "Next.js 14 App Router + Prisma + TypeScript + Expo/React Native. Server Actions para mutaciones web. 'use client' en Client Components. npx tsc --noEmit debe pasar. No generes Ruby ni Rails. Incluye tests (*.test.ts) para toda función pura nueva.",
+    "Backend":    "Next.js API routes y Server Actions. Prisma para DB. TypeScript. Sin Rails. Escribe tests de integración para cada route/action nueva.",
+    "Mobile":     "Expo/React Native. TypeScript. Respeta los tipos de mobile/lib/types.ts. No uses Flutter. Escribe tests unitarios para funciones puras en mobile/lib/.",
+    "QA":         "Experto en calidad. Tu tarea es SOLO escribir tests, nunca el código de implementación. Cubre: unit tests en src/lib/*.test.ts y mobile/lib/*.test.ts (Vitest), integration tests para Server Actions y API routes, regression tests para cambios en código existente, E2E en tests/e2e/*.spec.ts (Playwright). Todos los tests deben ejecutar y pasar con `npx vitest run`.",
 }
 
 
@@ -193,7 +271,9 @@ def _invoke_chain(primary, fallback_chain: list, messages: list) -> object:
 
 
 def _invoke_dev(messages: list) -> object:
-    return _invoke_chain(_minimax_dev, _OR_DEV_CHAIN, messages)
+    # Orden: Qwen Coder → Nemotron Ultra → Nemotron Super → Llama → MiniMax (último recurso)
+    # MiniMax va al final: responde rápido pero no sigue el formato FILE_BEGIN/END
+    return _invoke_chain(_qwen_dev, _OR_DEV_CHAIN + [_minimax_dev], messages)
 
 
 def _invoke_reviewer(messages: list) -> object:
@@ -232,12 +312,19 @@ def _invoke_reviewer_structured(messages: list) -> "ReviewerDecision":
     return ReviewerDecision(**_json.loads(_extract_json(content)))
 
 
-jira_client = Jira(
-    url=JIRA_URL,
-    username=JIRA_USERNAME,
-    password=JIRA_API_TOKEN,
-    cloud=True,
-)
+def _make_jira_client():
+    """Cliente Jira opcional: la Flota también resuelve requerimientos libres sin Jira."""
+    if not (JIRA_URL and JIRA_USERNAME and JIRA_API_TOKEN):
+        logger.info("Jira no configurado — modo requerimiento libre disponible (sin Jira).")
+        return None
+    try:
+        return Jira(url=JIRA_URL, username=JIRA_USERNAME, password=JIRA_API_TOKEN, cloud=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudo inicializar Jira (%s) — solo modo requerimiento libre.", e)
+        return None
+
+
+jira_client = _make_jira_client()
 
 # ===========================================================================
 # 2. Helpers de workspace real
@@ -306,6 +393,16 @@ def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
         # Si el modelo uso \n literal en lugar de newlines reales, desescapar
         if "\\n" in content and "\n" not in content:
             content = content.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "")
+        # Si el LLM generó una ruta absoluta del host (ej. /Users/moyarzun/proyecto/foo.rs),
+        # os.path.join ignoraría el workspace y el contenedor no tiene ese mount → EPERM.
+        # Normalizamos: si la ruta es absoluta, intentamos hacerla relativa al workspace;
+        # si no tiene el prefijo del workspace, simplemente quitamos la barra inicial.
+        if os.path.isabs(rel_path):
+            workspace_norm = workspace.rstrip("/")
+            if rel_path.startswith(workspace_norm + "/"):
+                rel_path = rel_path[len(workspace_norm) + 1:]
+            else:
+                rel_path = rel_path.lstrip("/")
         full_path = os.path.join(workspace, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         # Eliminar antes de escribir para evitar deadlock VirtioFS (Errno 35):
@@ -410,7 +507,7 @@ def _rails_grounding(workspace: str, criteria: str, max_bytes: int = 6000) -> st
             + "\n".join(parts))
 
 
-def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tuple:
+def _validate_workspace(workspace: str, applied_files: list, stack: str = "generic") -> tuple:
     """Validación DETERMINISTA del código generado. Devuelve (passed, reporte).
 
     Niveles (best-effort según herramientas disponibles en el contenedor):
@@ -424,9 +521,9 @@ def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tupl
     ran_any = False
     ok = True
 
-    # ── Nivel 1: sintaxis Ruby ──────────────────────────────────────────────
+    # ── Nivel 1a: sintaxis Ruby (solo proyectos Rails) ─────────────────────
     rb_files = [f for f in applied_files if f.endswith(".rb")]
-    if rb_files and _tool_available("ruby"):
+    if rb_files and stack == "rails" and _tool_available("ruby"):
         ran_any = True
         syntax_errors = []
         for rel in rb_files:
@@ -438,6 +535,111 @@ def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tupl
             report.append("SINTAXIS RUBY (ruby -c) — ERRORES:\n" + "\n".join(syntax_errors))
         else:
             report.append(f"SINTAXIS RUBY: ✓ {len(rb_files)} archivos .rb parsean correctamente.")
+
+    # ── Nivel 1b: TypeScript check (proyectos node) ────────────────────────
+    ts_files = [f for f in applied_files if f.endswith((".ts", ".tsx"))]
+    if ts_files and stack == "node":
+        tsc_available = _tool_available("npx")
+        if tsc_available:
+            ran_any = True
+            # Aumentar memoria para proyectos grandes; skipLibCheck para velocidad
+            rc, out = _run(
+                ["node", "--max-old-space-size=2048", "./node_modules/.bin/tsc",
+                 "--noEmit", "--skipLibCheck", "--incremental", "false"],
+                cwd=workspace, timeout=180,
+            )
+            oom = "Last few GCs" in out or "heap out of memory" in out.lower() or "JavaScript heap" in out
+            if oom:
+                # OOM no es fallo del código generado — avisar y continuar
+                report.append("TYPESCRIPT (tsc --noEmit): ⚠ OOM en el contenedor — check omitido")
+            elif rc == 0:
+                report.append("TYPESCRIPT (tsc --noEmit): ✓ sin errores de tipos")
+            else:
+                # Filtrar errores en archivos que la flota NO generó (pre-existentes).
+                # Un error en un archivo ajeno no debe bloquear el trabajo de la flota.
+                applied_set = set(applied_files)
+                error_lines = out.strip().splitlines()
+                # Patrón: "ruta/archivo.ts(linea,col): error TSxxxx: ..."
+                fleet_errors = []
+                preexisting_errors = []
+                for line in error_lines:
+                    m = _re.match(r'^([^(]+)\(\d+,\d+\): error', line)
+                    if m:
+                        file_path = m.group(1).replace("\\", "/").lstrip("./")
+                        if file_path in applied_set:
+                            fleet_errors.append(line)
+                        else:
+                            preexisting_errors.append(line)
+                    else:
+                        # Líneas de continuación o resumen: adjuntar al último bucket
+                        if fleet_errors:
+                            fleet_errors.append(line)
+                        elif preexisting_errors:
+                            preexisting_errors.append(line)
+
+                # Errores de módulos mobile (react-native, expo) en archivos fleet son
+                # falsos positivos: el tsconfig web no ve esas deps. No bloquear.
+                _MOBILE_MODULES = (
+                    "'react-native'", "'@expo/", "'expo-", "'react-native-",
+                    "'@react-native", "@react-navigation",
+                )
+                real_fleet_errors = [
+                    l for l in fleet_errors
+                    if not any(m in l for m in _MOBILE_MODULES)
+                ]
+                env_mobile_errors = [
+                    l for l in fleet_errors if l not in real_fleet_errors
+                ]
+
+                if real_fleet_errors:
+                    ok = False
+                    tail = "\n".join(real_fleet_errors[-30:])
+                    report.append(f"TYPESCRIPT (tsc --noEmit): ✗\n{tail}")
+                else:
+                    ignored = len(preexisting_errors) + len(env_mobile_errors)
+                    report.append(
+                        f"TYPESCRIPT (tsc --noEmit): ✓ sin errores en archivos generados "
+                        f"(ignorados: {ignored} línea(s) pre-existentes o módulos mobile)"
+                    )
+
+    # ── Nivel 1c: Vitest unit/integration tests (proyectos node) ──────────────
+    # Corre los tests de Vitest cuando:
+    #   - stack es node y npx disponible
+    #   - hay archivos *.test.ts/.spec.ts entre los archivos generados, O hay vitest.config.ts
+    # El gate solo bloquea si los tests FALLAN (no si vitest no está instalado).
+    if stack == "node" and ok and _tool_available("npx"):
+        has_test_files = any(
+            ".test." in f or (f.endswith(".spec.ts") and "e2e" not in f)
+            for f in applied_files
+        )
+        has_vitest_config = os.path.exists(os.path.join(workspace, "vitest.config.ts")) or \
+                            os.path.exists(os.path.join(workspace, "vitest.config.js"))
+        if has_test_files or has_vitest_config:
+            ran_any = True
+            rc, out = _run(
+                ["node", "--max-old-space-size=2048", "./node_modules/.bin/vitest",
+                 "run", "--reporter=verbose"],
+                cwd=workspace,
+                timeout=int(os.getenv("FLEET_VITEST_TIMEOUT", "180")),
+            )
+            tail = "\n".join(out.strip().splitlines()[-40:])
+            if "Cannot find module" in out and "vitest" in out:
+                report.append("VITEST: ⚠ vitest no encontrado en node_modules — instala con npm install")
+            elif rc == 0:
+                # Extraer resumen compacto de tests pasados
+                summary_match = _re.search(r'Test Files.*\n?.*Tests\s+\d+', out)
+                summary = summary_match.group(0).strip() if summary_match else f"exit 0"
+                report.append(f"VITEST (npx vitest run): ✓ {summary}\n{tail[-800:]}")
+            else:
+                ok = False
+                report.append(f"VITEST (npx vitest run): ✗ exit {rc}\n{tail}")
+        else:
+            report.append(
+                "VITEST: ⚠ no hay archivos *.test.ts ni vitest.config.ts detectados. "
+                "OBLIGATORIO: todo cambio de código debe incluir sus tests unitarios "
+                "(src/lib/*.test.ts o mobile/lib/*.test.ts). Agrega tests antes de continuar."
+            )
+            ok = False  # Forzar ciclo de corrección si no hay tests
 
     # ── Nivel 2: comando de validación del proyecto (tests reales) ───────────
     validate_cmd = os.getenv("FLEET_VALIDATE_CMD")
@@ -475,6 +677,7 @@ def _validate_workspace(workspace: str, applied_files: list, stack: str) -> tupl
 class FleetState(TypedDict):
     messages:            Annotated[List[BaseMessage], add_messages]
     ticket_id:           str
+    requirement:         str         # requerimiento libre (sin Jira); si está, ignora ticket_id
     workspace_path:      str
     acceptance_criteria: str
     required_agents:     List[str]
@@ -491,6 +694,12 @@ class FleetState(TypedDict):
     validation_report:   str         # salida determinista (ruby -c / tests)
     validation_passed:   bool        # gate determinista
     pr_url:              str         # URL del PR si se abrió
+    existing_files:      Dict[str, str]  # contenido de archivos existentes antes de modificar
+    regression_errors:   List[str]       # elementos eliminados detectados por regression_guard
+    # ── Staging tester ──
+    staging_url:         str         # URL del deploy de staging (Vercel preview o STAGING_BASE_URL)
+    staging_passed:      bool        # True si los smoke/E2E de staging pasaron (o si staging no está configurado)
+    staging_report:      str         # salida del staging_tester_node
 
 
 class ReviewerDecision(BaseModel):
@@ -499,21 +708,96 @@ class ReviewerDecision(BaseModel):
 
 
 # ===========================================================================
+# 3b. Helpers de análisis de regresión (codebase_reader / regression_guard)
+# ===========================================================================
+
+# Archivos clave a leer siempre según el stack (independientemente de lo que diga el planner)
+_KEY_FILES_BY_STACK: Dict[str, List[str]] = {
+    "node": [
+        "prisma/schema.prisma",
+        "package.json",
+        "vitest.config.ts",
+        "vitest.config.js",
+        "src/lib/sms.ts",
+        "src/lib/auth.ts",
+        "src/server/auth/context.ts",
+        "src/server/http.ts",
+        "src/lib/mobile-api.ts",
+    ],
+    "rails": [
+        "db/schema.rb",
+        "Gemfile",
+    ],
+    "flutter": [
+        "pubspec.yaml",
+    ],
+}
+
+
+def _check_prisma_regression(old: str, new: str) -> List[str]:
+    """Detecta modelos o campos Prisma eliminados en la versión generada."""
+    issues = []
+
+    old_models = set(_re.findall(r'^model\s+(\w+)\s*\{', old, _re.MULTILINE))
+    new_models = set(_re.findall(r'^model\s+(\w+)\s*\{', new, _re.MULTILINE))
+    removed_models = old_models - new_models
+    if removed_models:
+        issues.append(f"modelos eliminados del schema: {sorted(removed_models)}")
+
+    for model in (old_models & new_models):
+        old_block = _re.search(rf'^model\s+{model}\s*\{{([^}}]+)\}}', old, _re.MULTILINE | _re.DOTALL)
+        new_block = _re.search(rf'^model\s+{model}\s*\{{([^}}]+)\}}', new, _re.MULTILINE | _re.DOTALL)
+        if not old_block or not new_block:
+            continue
+        old_fields = set(_re.findall(r'^\s{1,4}(\w+)\s+\w', old_block.group(1), _re.MULTILINE))
+        new_fields = set(_re.findall(r'^\s{1,4}(\w+)\s+\w', new_block.group(1), _re.MULTILINE))
+        removed = old_fields - new_fields - {'@@', '//'}
+        if removed:
+            issues.append(f"modelo {model}: campos eliminados: {sorted(removed)}")
+
+    return issues
+
+
+def _check_ts_exports_regression(old: str, new: str) -> List[str]:
+    """Detecta exports de TypeScript/JS eliminados en la versión generada."""
+    pat = r'^export\s+(?:async\s+)?(?:function|class|const|type|interface|enum)\s+(\w+)'
+    old_exports = set(_re.findall(pat, old, _re.MULTILINE))
+    new_exports = set(_re.findall(pat, new, _re.MULTILINE))
+    removed = old_exports - new_exports
+    if removed:
+        return [f"exports eliminados: {sorted(removed)}"]
+    return []
+
+
+# ===========================================================================
 # 4. Nodos del grafo
 # ===========================================================================
 def fetch_and_plan_node(state: FleetState) -> dict:
-    ticket_id   = state["ticket_id"]
-    _log(f"[context_ingestion] Leyendo ticket {ticket_id} desde Jira...")
-    issue_data  = jira_client.issue(ticket_id)
-    summary     = issue_data["fields"]["summary"]
-    description = issue_data["fields"]["description"] or ""
-    labels      = issue_data["fields"].get("labels", [])
+    ticket_id   = state.get("ticket_id", "")
+    requirement = (state.get("requirement") or "").strip()
+    preset_agents = state.get("required_agents") or []
 
-    _log(f"[context_ingestion] Ticket: {summary}")
-
-    required_agents = [lbl.split(":")[1] for lbl in labels if lbl.startswith("agent:")]
-    if not required_agents:
-        required_agents = ["Full-Stack"]
+    if requirement:
+        # ── Modo requerimiento libre: cualquier proyecto, sin Jira ──────────────
+        summary     = requirement.split("\n", 1)[0][:120]
+        description = requirement
+        _log(f"[context_ingestion] Modo requerimiento libre: {summary}")
+        required_agents = preset_agents or ["Full-Stack"]
+    elif jira_client is not None:
+        # ── Modo Jira (compatibilidad) ──────────────────────────────────────────
+        _log(f"[context_ingestion] Leyendo ticket {ticket_id} desde Jira...")
+        issue_data  = jira_client.issue(ticket_id)
+        summary     = issue_data["fields"]["summary"]
+        description = issue_data["fields"]["description"] or ""
+        labels      = issue_data["fields"].get("labels", [])
+        _log(f"[context_ingestion] Ticket: {summary}")
+        required_agents = [lbl.split(":")[1] for lbl in labels if lbl.startswith("agent:")]
+        required_agents = required_agents or preset_agents or ["Full-Stack"]
+    else:
+        raise RuntimeError(
+            "Sin 'requirement' ni Jira configurado. Provee un requerimiento libre "
+            "o configura JIRA_URL/JIRA_USER/JIRA_API_TOKEN."
+        )
 
     _log(f"[context_ingestion] Agentes asignados: {required_agents}")
     desc_preview = (description[:120] + "...") if len(description) > 120 else description
@@ -589,11 +873,28 @@ def planner_node(state: FleetState) -> dict:
     workspace = state["workspace_path"]
 
     grounding = _rails_grounding(workspace, criteria) if stack == "rails" else ""
+    stack_hint = {
+        "rails": (
+            "Para Rails el orden típico es: migración/esquema → modelo → factory → spec → controller. "
+            "OBLIGATORIO: incluye al menos una subtarea de tests (RSpec) para el comportamiento nuevo."
+        ),
+        "node": (
+            "Para Next.js+Prisma el orden típico es: "
+            "1) schema.prisma+migración, "
+            "2) funciones puras en src/lib/ CON su *.test.ts (TDD: escribe el test antes), "
+            "3) componentes/Server Actions, "
+            "4) integración en páginas/forms, "
+            "5) tests de integración (Server Actions / API routes), "
+            "6) tests E2E en tests/e2e/*.spec.ts si hay flujos de UI. "
+            "OBLIGATORIO: las subtareas de testing son parte del plan, no opcionales. "
+            "Un cambio sin tests unitarios NO cumple los criterios de aceptación."
+        ),
+        "flutter": "Para Flutter: modelos → servicios → widgets → pantallas → tests (widget tests).",
+    }.get(stack, "")
     sys = SystemMessage(content=(
         "Eres el Tech Lead. Descompón el ticket en 2 a 6 subtareas atómicas, ordenadas "
         "por dependencia y CADA una verificable (qué archivo se toca y cómo se comprueba). "
-        "Para Rails el orden típico es: migración/esquema → modelo (enum⇒columna/attribute) "
-        "→ factory → spec (require rails_helper) → controller. "
+        f"{stack_hint} "
         "Responde SOLO un array JSON de strings, sin texto extra."
     ))
     human = HumanMessage(content=f"TICKET:\n{criteria}\n\n{grounding}\n\nDevuelve el array JSON de subtareas.")
@@ -616,6 +917,113 @@ def planner_node(state: FleetState) -> dict:
     }
 
 
+def codebase_reader_node(state: FleetState) -> dict:
+    """Lee los archivos existentes que el desarrollador va a modificar.
+
+    Objetivo: que el LLM vea el contenido REAL antes de escribir, eliminando
+    la causa raíz de las regresiones (ej: reemplazar schema.prisma completo).
+    """
+    workspace = state["workspace_path"]
+    stack     = state.get("stack", "generic")
+    subtasks  = state.get("subtasks", [])
+    criteria  = state.get("acceptance_criteria", "")
+
+    # Extraer rutas mencionadas en subtasks y criterios
+    text = "\n".join(subtasks) + "\n" + criteria
+    found = _re.findall(
+        r'[\w/\-\.]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml)',
+        text
+    )
+    candidates = list(dict.fromkeys(
+        _KEY_FILES_BY_STACK.get(stack, []) + found
+    ))
+
+    existing: Dict[str, str] = {}
+    for rel in candidates:
+        full = os.path.join(workspace, rel)
+        if os.path.isfile(full):
+            try:
+                with open(full, errors="replace") as fh:
+                    existing[rel] = fh.read(80_000)
+            except Exception:
+                pass
+
+    _log(f"[codebase_reader] {len(existing)} archivos existentes capturados: "
+         + ", ".join(list(existing.keys())[:8])
+         + (f" (+{len(existing)-8} más)" if len(existing) > 8 else ""))
+    return {
+        "existing_files":   existing,
+        "regression_errors": [],
+        "messages": [AIMessage(
+            content=f"codebase_reader: {len(existing)} archivos leídos",
+            name="CodebaseReader"
+        )],
+    }
+
+
+def regression_guard_node(state: FleetState) -> dict:
+    """Verifica que los archivos generados no eliminaron contenido existente.
+
+    Corre DESPUÉS del dynamic_developer y ANTES de validation_gate. Si detecta
+    regresiones (modelos/campos/exports eliminados), pone validation_passed=False
+    y un reporte detallado que el developer recibirá en el próximo ciclo.
+    """
+    workspace      = state["workspace_path"]
+    existing_files = state.get("existing_files", {})
+    applied_files  = set(state.get("applied_files", []))
+
+    issues: List[str] = []
+
+    for rel, old_content in existing_files.items():
+        if rel not in applied_files:
+            continue  # archivo no tocado — sin riesgo
+
+        full = os.path.join(workspace, rel)
+        if not os.path.exists(full):
+            issues.append(f"ELIMINADO: {rel} fue borrado por el generador")
+            continue
+
+        try:
+            with open(full, errors="replace") as fh:
+                new_content = fh.read()
+        except Exception:
+            continue
+
+        if rel.endswith("schema.prisma"):
+            issues.extend(_check_prisma_regression(old_content, new_content))
+        elif rel.endswith((".ts", ".tsx", ".js")):
+            issues.extend(
+                f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content)
+            )
+
+    if issues:
+        issues_text = "\n".join(f"  - {i}" for i in issues)
+        report = (
+            "REGRESIÓN DETECTADA — el código generado eliminó elementos existentes:\n"
+            f"{issues_text}\n\n"
+            "REGLA CRÍTICA: Cuando modificas un archivo existente, debes incluir TODO "
+            "el contenido original (todos sus modelos, campos, funciones, exports) y "
+            "solo AÑADIR los elementos nuevos. El bloque ARCHIVOS EXISTENTES del prompt "
+            "muestra el contenido que DEBE aparecer en tu output."
+        )
+        _log(f"[regression_guard] ⚠ {len(issues)} regresión(es): {issues[:3]}")
+        return {
+            "regression_errors": issues,
+            "validation_passed": False,
+            "validation_report": report,
+            "messages": [AIMessage(
+                content=f"regression_guard: ⚠ {len(issues)} regresión(es) detectadas",
+                name="RegressionGuard"
+            )],
+        }
+
+    _log(f"[regression_guard] ✓ sin regresiones ({len(existing_files)} archivos verificados)")
+    return {
+        "regression_errors": [],
+        "messages": [AIMessage(content="regression_guard: ✓ sin regresiones", name="RegressionGuard")],
+    }
+
+
 def dynamic_developer_node(state: FleetState) -> dict:
     """Propone e implementa cambios REALES en el workspace montado."""
     workspace       = state["workspace_path"]
@@ -635,41 +1043,75 @@ def dynamic_developer_node(state: FleetState) -> dict:
     new_diffs   = {}
     all_applied = list(prev_applied)  # acumular entre ciclos
 
-    FORMAT_EXAMPLE = (
-        "FORMATO OBLIGATORIO — copia este patron para CADA archivo:\n\n"
-        "===FILE_BEGIN: ruta/relativa/ejemplo.py===\n"
-        "# contenido completo del archivo aqui\n"
-        "print('hola mundo')\n"
-        "===FILE_END===\n\n"
-        "===FILE_BEGIN: otro/archivo.js===\n"
-        "console.log('otro archivo');\n"
-        "===FILE_END===\n"
-    )
-
     cycle = state["loop_iterations"] + 1
     _log(f"[dynamic_developer] --- Ciclo {cycle} ---")
     if feedback and feedback != "Implementacion inicial requerida.":
         _log(f"[dynamic_developer] Feedback del revisor: {feedback[:150]}")
 
     stack       = state.get("stack", "generic")
-    subtasks    = state.get("subtasks", [])
-    grounding   = _rails_grounding(workspace, criteria) if stack == "rails" else ""
-    subtask_txt = ("PLAN DE SUBTAREAS (impleméntalas todas, en orden):\n"
-                   + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(subtasks)) + "\n\n") if subtasks else ""
+
+    if stack == "node":
+        FORMAT_EXAMPLE = (
+            "FORMATO OBLIGATORIO — copia este patron para CADA archivo:\n\n"
+            "===FILE_BEGIN: src/lib/ejemplo.ts===\n"
+            "export function ejemplo(): string {\n"
+            "  return 'hola';\n"
+            "}\n"
+            "===FILE_END===\n\n"
+            "===FILE_BEGIN: src/components/ui/Ejemplo.tsx===\n"
+            "'use client';\n"
+            "export function Ejemplo() {\n"
+            "  return <div>ejemplo</div>;\n"
+            "}\n"
+            "===FILE_END===\n"
+        )
+    else:
+        FORMAT_EXAMPLE = (
+            "FORMATO OBLIGATORIO — copia este patron para CADA archivo:\n\n"
+            "===FILE_BEGIN: ruta/relativa/ejemplo.py===\n"
+            "# contenido completo del archivo aqui\n"
+            "print('hola mundo')\n"
+            "===FILE_END===\n\n"
+            "===FILE_BEGIN: otro/archivo.js===\n"
+            "console.log('otro archivo');\n"
+            "===FILE_END===\n"
+        )
+    subtasks       = state.get("subtasks", [])
+    existing_files = state.get("existing_files", {})
+    grounding      = _rails_grounding(workspace, criteria) if stack == "rails" else ""
+    subtask_txt    = ("PLAN DE SUBTAREAS (impleméntalas todas, en orden):\n"
+                      + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(subtasks)) + "\n\n") if subtasks else ""
+
+    # Contexto de archivos existentes: el LLM DEBE preservar todo su contenido
+    if existing_files:
+        existing_parts = [
+            "ARCHIVOS EXISTENTES (DEBES PRESERVAR TODO SU CONTENIDO — incluye cada "
+            "campo, modelo y función original + tus adiciones nuevas):"
+        ]
+        for rel, content in existing_files.items():
+            existing_parts.append(f"\n===FILE_EXISTING: {rel}===\n{content}\n===FILE_EXISTING_END===")
+        existing_files_ctx = "\n".join(existing_parts)
+    else:
+        existing_files_ctx = ""
+
+    guardrails = _get_guardrails(stack)
+    playbooks  = ROLE_PLAYBOOKS_NODE if stack == "node" else ROLE_PLAYBOOKS
 
     for agent_role in agents:
-        playbook = ROLE_PLAYBOOKS.get(agent_role, ROLE_PLAYBOOKS["Full-Stack"])
+        playbook = playbooks.get(agent_role, playbooks.get("Full-Stack", ROLE_PLAYBOOKS["Full-Stack"]))
         system_instruction = (
             f"Eres un experto en {agent_role}. {playbook}\n"
             "Tu unica tarea es escribir codigo. NO expliques nada. NO describas lo que vas a hacer.\n"
             "SOLO escribe los archivos usando el formato especificado.\n\n"
-            + ENGINEERING_GUARDRAILS + "\n\n"
-            "CRITICO — REGLAS ANTI-TRUNCACION:\n"
+            + guardrails + "\n\n"
+            "CRITICO — REGLAS ANTI-TRUNCACION Y ANTI-REGRESION:\n"
             "1. Cada archivo debe estar COMPLETO desde la primera hasta la ultima linea.\n"
             "2. NUNCA uses '...', '# rest of implementation', '// TODO', '# continua...' ni ningun placeholder.\n"
             "3. Si un archivo seria muy grande, divídelo en archivos mas pequeños cohesivos en lugar de truncar.\n"
             "4. El ultimo caracter de cada bloque FILE_BEGIN/FILE_END debe ser el cierre real del archivo.\n"
-            "5. NO escapes comillas ni saltos de linea: escribe el archivo tal cual debe quedar en disco.\n\n"
+            "5. NO escapes comillas ni saltos de linea: escribe el archivo tal cual debe quedar en disco.\n"
+            "6. ANTI-REGRESION: Si modificas un archivo existente (ver ARCHIVOS EXISTENTES abajo), "
+            "DEBES incluir TODO su contenido original. Ningun campo, modelo ni funcion puede desaparecer.\n\n"
             + FORMAT_EXAMPLE
         )
         human_instruction = (
@@ -677,6 +1119,7 @@ def dynamic_developer_node(state: FleetState) -> dict:
             f"{subtask_txt}"
             f"{grounding}\n\n"
             f"RESULTADO DE LA VALIDACION/REVISION ANTERIOR (corrige ESTO primero):\n{feedback}\n\n"
+            f"{existing_files_ctx}\n\n"
             f"CONTEXTO DEL WORKSPACE:\n{workspace_context}\n\n"
             f"ARCHIVOS YA EN DISCO: {prev_applied}\n\n"
             "Escribe ahora TODOS los archivos necesarios usando bloques "
@@ -759,6 +1202,20 @@ def validation_gate_node(state: FleetState) -> dict:
         return {"validation_passed": False,
                 "validation_report": "No se generó ningún archivo.",
                 "messages": [AIMessage(content="Validación: sin archivos", name="Validator")]}
+
+    # Si regression_guard ya detectó regresiones, no correr tsc — el reporte ya está listo
+    regression_errors = state.get("regression_errors", [])
+    if regression_errors:
+        report = state.get("validation_report", "(reporte de regresión)")
+        _log(f"[validation_gate] Regresiones pendientes — saltando tsc ({len(regression_errors)} issues)")
+        return {
+            "validation_passed": False,
+            "validation_report": report,
+            "messages": [AIMessage(
+                content=f"Validación: REGRESIÓN ({len(regression_errors)} issues)",
+                name="Validator"
+            )],
+        }
 
     _log(f"[validation_gate] Validando {len(applied_files)} archivos (stack={stack})...")
     passed, report = _validate_workspace(workspace, applied_files, stack)
@@ -903,6 +1360,109 @@ def git_finalize_node(state: FleetState) -> dict:
     return {"pr_url": pr_url, "messages": [AIMessage(content=f"Rama {branch} empujada{' · PR ' + pr_url if pr_url else ''}", name="GitOps")]}
 
 
+def staging_tester_node(state: FleetState) -> dict:
+    """Smoke tests + E2E contra staging. No-op si no hay URL configurada."""
+    workspace = state.get("workspace_path", "")
+    report: list[str] = []
+    ok = True
+
+    # ── 1. Determinar la URL de staging ────────────────────────────────────
+    staging_url = os.getenv("STAGING_BASE_URL", "").strip()
+
+    if not staging_url:
+        # Intentar deploy automático a Vercel si el proyecto tiene .vercel/project.json
+        vercel_cfg = os.path.join(workspace, ".vercel", "project.json")
+        if os.path.exists(vercel_cfg) and _tool_available("vercel"):
+            _log("[staging_tester] .vercel/project.json detectado — desplegando a staging…")
+            rc, out = _run(
+                ["vercel", "deploy", "--target", "staging", "--yes", "--no-wait"],
+                cwd=workspace, timeout=int(os.getenv("FLEET_STAGING_DEPLOY_TIMEOUT", "300")),
+            )
+            if rc == 0:
+                m = _re.search(r'https://[^\s]+\.vercel\.app', out)
+                if m:
+                    staging_url = m.group(0).strip()
+                    _log(f"[staging_tester] preview URL: {staging_url}")
+            else:
+                report.append(f"STAGING DEPLOY: ✗ vercel deploy falló (exit {rc})\n{out[-500:]}")
+                ok = False
+
+    if not staging_url:
+        msg = (
+            "STAGING: ⚠ URL no configurada — se omite el test de staging.\n"
+            "  Para activarlo: define STAGING_BASE_URL=<url> en .env\n"
+            "  o asegúrate de que .vercel/project.json exista y `vercel` CLI esté instalado."
+        )
+        _log(f"[staging_tester] {msg}")
+        return {
+            "staging_url":    "",
+            "staging_passed": True,   # No bloqueamos si staging no está configurado
+            "staging_report": msg,
+            "messages": [AIMessage(content="staging omitido — URL no configurada", name="StagingTester")],
+        }
+
+    report.append(f"STAGING TEST → {staging_url}\n")
+
+    # ── 2. Smoke tests de API (curl, sin autenticación) ─────────────────────
+    smoke_checks = [
+        ("/",                                     ["200", "301", "302"], "home"),
+        ("/api/mobile/admin/support-data",        ["401", "307", "403"], "support-data (sin auth)"),
+    ]
+    if state.get("stack") == "node":
+        smoke_checks.append(("/api/health", ["200", "404"], "health endpoint"))
+
+    for path, expected_codes, label in smoke_checks:
+        url = staging_url.rstrip("/") + path
+        rc, out = _run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--connect-timeout", "10", "--max-time", "15", "-L", url],
+            cwd="/", timeout=20,
+        )
+        code = out.strip()
+        if code in expected_codes:
+            report.append(f"  ✓ {label}: HTTP {code}")
+        else:
+            report.append(f"  ✗ {label}: esperaba {expected_codes}, obtuvo '{code}'")
+            ok = False
+
+    # ── 3. Playwright E2E contra la URL de staging ──────────────────────────
+    e2e_dir = os.path.join(workspace, "tests", "e2e")
+    playwright_bin = os.path.join(workspace, "node_modules", ".bin", "playwright")
+    if os.path.isdir(e2e_dir) and os.path.exists(playwright_bin):
+        _log(f"[staging_tester] ejecutando E2E de Playwright contra {staging_url}")
+        env_with_url = {**os.environ, "PLAYWRIGHT_BASE_URL": staging_url}
+        try:
+            p = subprocess.run(
+                ["node", playwright_bin, "test", "--reporter=list", "--project=chromium"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("FLEET_STAGING_E2E_TIMEOUT", "300")),
+                env=env_with_url,
+            )
+            tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-30:])
+            if p.returncode == 0:
+                report.append(f"  ✓ Playwright E2E: todos los tests pasan\n{tail}")
+            else:
+                report.append(f"  ✗ Playwright E2E: tests fallando (exit {p.returncode})\n{tail}")
+                ok = False
+        except subprocess.TimeoutExpired:
+            report.append("  ✗ Playwright E2E: TIMEOUT — los tests tardaron demasiado")
+            ok = False
+    else:
+        report.append("  ⚠ Playwright E2E: omitido (playwright no instalado en node_modules o sin tests/e2e/)")
+
+    full_report = "\n".join(report)
+    verdict = "✓ STAGING PASÓ" if ok else "✗ STAGING FALLÓ"
+    _log(f"[staging_tester] {verdict}")
+    return {
+        "staging_url":    staging_url,
+        "staging_passed": ok,
+        "staging_report": full_report,
+        "messages": [AIMessage(content=f"{verdict}\n{full_report}", name="StagingTester")],
+    }
+
+
 def finalize_and_update_jira(state: FleetState) -> dict:
     ticket_id    = state["ticket_id"]
     feedback     = state["reviewer_feedback"]
@@ -914,11 +1474,26 @@ def finalize_and_update_jira(state: FleetState) -> dict:
     branch       = state.get("work_branch", "")
     # "Hecho" SOLO si validación determinista pasó Y el revisor aprobó. Si no, va a
     # revisión humana (nunca se marca como terminado código que no pasó los tests).
-    done = is_approved and val_passed
+    staging_passed = state.get("staging_passed", True)
+    staging_url    = state.get("staging_url", "")
+    staging_report = state.get("staging_report", "")
+    done = is_approved and val_passed and staging_passed
     status_parts = []
 
-    result_label = "APROBADO+VALIDADO" if done else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, max ciclos={iterations})"
+    result_label = (
+        "APROBADO+VALIDADO+STAGING" if done
+        else f"REQUIERE REVISIÓN (val={'ok' if val_passed else 'falló'}, staging={'ok' if staging_passed else 'falló'}, max ciclos={iterations})"
+    )
     _log(f"[jira_updater] Finalizando — resultado: {result_label}")
+
+    # Modo requerimiento libre (sin Jira): el entregable es la rama + PR; no hay
+    # ticket que comentar/transicionar.
+    if (state.get("requirement") or "").strip() or jira_client is None:
+        msg = (f"Finalizado ({result_label}). "
+               + (f"PR: {pr_url}" if pr_url else (f"Rama: {branch}" if branch else "sin git"))
+               + " · (sin Jira)")
+        _log(f"[jira_updater] {msg}")
+        return {"messages": [AIMessage(content=msg, name="Done")]}
 
     comment = (
         f"Implementacion procesada por la Flota de Agentes\n\n"
@@ -926,8 +1501,11 @@ def finalize_and_update_jira(state: FleetState) -> dict:
         f"Archivos modificados: {len(applied)}\n"
         f"Validación determinista (sintaxis/tests): {'PASÓ ✓' if val_passed else 'FALLÓ ✗'}\n"
         f"Revisor semántico: {'APROBÓ ✓' if is_approved else 'RECHAZÓ ✗'}\n"
+        f"Staging tests: {'PASÓ ✓' if staging_passed else 'FALLÓ ✗'}"
+        + (f" — {staging_url}" if staging_url else " (no configurado)") + "\n"
         + (f"Rama: {branch}\n" if branch else "")
         + (f"Pull Request: {pr_url}\n" if pr_url else "")
+        + (f"\nResultado staging:\n{staging_report}\n" if staging_url and not staging_passed else "")
         + f"\nResultado del revisor:\n{feedback}"
     )
     _log(f"[jira_updater] Añadiendo comentario en {ticket_id}...")
@@ -971,7 +1549,11 @@ def finalize_and_update_jira(state: FleetState) -> dict:
 # 5. Parada grácil iniciada por el usuario
 # ===========================================================================
 def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied_files: list) -> None:
-    """Comenta el estado actual en Jira y transiciona el ticket a Bloqueado."""
+    """Comenta el estado actual en Jira y transiciona el ticket a Bloqueado.
+    No-op si no hay Jira (modo requerimiento libre)."""
+    if jira_client is None:
+        logger.info("stop_gracefully: sin Jira; nada que actualizar.")
+        return
     files_list = "\n".join(f"  - {f}" for f in applied_files) if applied_files else "  (ninguno)"
     comment = (
         f"⚠️ *Ejecución detenida por el usuario.*\n\n"
@@ -1017,28 +1599,34 @@ def quality_gate_router(state: FleetState) -> str:
 # ===========================================================================
 def build_architecture() -> StateGraph:
     graph = StateGraph(FleetState)
-    graph.add_node("context_ingestion", fetch_and_plan_node)
-    graph.add_node("git_setup",         git_setup_node)
-    graph.add_node("planner",           planner_node)
-    graph.add_node("dynamic_developer", dynamic_developer_node)
-    graph.add_node("validation_gate",   validation_gate_node)
-    graph.add_node("quality_reviewer",  reviewer_node)
-    graph.add_node("git_finalize",      git_finalize_node)
-    graph.add_node("jira_updater",      finalize_and_update_jira)
+    graph.add_node("context_ingestion",  fetch_and_plan_node)
+    graph.add_node("git_setup",          git_setup_node)
+    graph.add_node("planner",            planner_node)
+    graph.add_node("codebase_reader",    codebase_reader_node)    # lee archivos antes de modificar
+    graph.add_node("dynamic_developer",  dynamic_developer_node)
+    graph.add_node("regression_guard",   regression_guard_node)   # detecta regresiones post-generación
+    graph.add_node("validation_gate",    validation_gate_node)
+    graph.add_node("quality_reviewer",   reviewer_node)
+    graph.add_node("git_finalize",       git_finalize_node)
+    graph.add_node("staging_tester",     staging_tester_node)      # smoke tests + E2E contra staging
+    graph.add_node("jira_updater",       finalize_and_update_jira)
 
     graph.add_edge(START, "context_ingestion")
     graph.add_edge("context_ingestion", "git_setup")
-    graph.add_edge("git_setup", "planner")
-    graph.add_edge("planner", "dynamic_developer")
-    graph.add_edge("dynamic_developer", "validation_gate")   # ejecuta el código
-    graph.add_edge("validation_gate", "quality_reviewer")    # luego juicio semántico
+    graph.add_edge("git_setup",         "planner")
+    graph.add_edge("planner",           "codebase_reader")         # captura archivos existentes
+    graph.add_edge("codebase_reader",   "dynamic_developer")
+    graph.add_edge("dynamic_developer", "regression_guard")        # verifica regresiones antes de tsc
+    graph.add_edge("regression_guard",  "validation_gate")
+    graph.add_edge("validation_gate",   "quality_reviewer")
     graph.add_conditional_edges(
         "quality_reviewer",
         quality_gate_router,
         {"dynamic_developer": "dynamic_developer", "git_finalize": "git_finalize"},
     )
-    graph.add_edge("git_finalize", "jira_updater")
-    graph.add_edge("jira_updater", END)
+    graph.add_edge("git_finalize",   "staging_tester")             # deploy + smoke + E2E en staging
+    graph.add_edge("staging_tester", "jira_updater")
+    graph.add_edge("jira_updater",   END)
     return graph.compile()
 
 
@@ -1046,19 +1634,25 @@ def build_architecture() -> StateGraph:
 # 9. Entrypoint — invocado por fleet_api.py o directo via CLI
 # ===========================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Flota multi-agente LangGraph para tickets de Jira")
-    parser.add_argument("--ticket",    required=True, help="ID del ticket de Jira (ej. SCRUM-28)")
-    parser.add_argument("--workspace", required=True, help="Ruta al directorio del proyecto")
+    parser = argparse.ArgumentParser(description="Flota multi-agente LangGraph (Jira o requerimiento libre)")
+    parser.add_argument("--ticket",      help="ID del ticket de Jira (ej. SCRUM-28)")
+    parser.add_argument("--requirement", help="Requerimiento libre en texto (sin Jira). Cualquier proyecto.")
+    parser.add_argument("--workspace",   required=True, help="Ruta al directorio del proyecto")
+    parser.add_argument("--agents",      default="", help="Roles separados por coma (ej. Rails,Schema)")
     args = parser.parse_args()
+
+    if not args.ticket and not args.requirement:
+        parser.error("Debes indicar --ticket o --requirement")
 
     logging.basicConfig(level=logging.INFO)
     engine = build_architecture()
     initial_payload: FleetState = {
         "messages":            [],
-        "ticket_id":           args.ticket,
+        "ticket_id":           args.ticket or f"TASK-{os.urandom(4).hex()}",
+        "requirement":         args.requirement or "",
         "workspace_path":      args.workspace,
         "acceptance_criteria": "",
-        "required_agents":     [],
+        "required_agents":     [a.strip() for a in args.agents.split(",") if a.strip()],
         "current_code_diff":   {},
         "applied_files":       [],
         "reviewer_feedback":   "",
@@ -1071,9 +1665,14 @@ if __name__ == "__main__":
         "validation_report":   "",
         "validation_passed":   False,
         "pr_url":              "",
+        "existing_files":      {},
+        "regression_errors":   [],
+        "staging_url":         "",
+        "staging_passed":      True,
+        "staging_report":      "",
     }
 
-    print(f"\nIniciando flota para ticket: {args.ticket}")
+    print(f"\nIniciando flota para: {args.ticket or args.requirement[:60]}")
     for step_event in engine.stream(initial_payload, stream_mode="updates"):
         for node_name, data in step_event.items():
             if data.get("messages"):
