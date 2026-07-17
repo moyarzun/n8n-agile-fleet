@@ -561,6 +561,72 @@ def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
     return protected
 
 
+# Extensión de ruta de archivo de código/config que reconocemos al parsear
+# rutas dentro del texto del requerimiento (mismo set que codebase_reader).
+_FILE_PATH_RE = r"[\w/\-\.]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|yaml|yml|md|sh|css|scss|html|vue)"
+
+# Requerimiento 15: frases de prohibición explícita por nombre de archivo. El
+# req 11 solo cubría el caso "companion no mencionado"; acá se cubre el caso
+# opuesto y más fuerte — el requerimiento nombra el archivo y dice que NO se
+# toque. Ese archivo debe ser hard-reject si el agente lo modifica igual.
+_FORBID_MARKERS = (
+    "no modifiques", "no modificar", "no toques", "no tocar", "no edites",
+    "no editar", "no cambies", "no cambiar", "no reescribas", "no reescribir",
+    "no alteres", "no alterar", "sin tocar", "sin modificar", "no modifica",
+)
+
+
+def _mentioned_file_paths(criteria: str) -> set:
+    """Todas las rutas de archivo mencionadas en el texto del requerimiento."""
+    if not criteria:
+        return set()
+    return set(_re.findall(_FILE_PATH_RE, criteria))
+
+
+def _find_explicitly_forbidden_files(criteria: str) -> set:
+    """Rutas que el requerimiento prohíbe tocar por nombre (requerimiento 15,
+    criterio 1). Busca cada frase de prohibición (_FORBID_MARKERS) y captura
+    la primera ruta de archivo que aparezca en una ventana de texto posterior
+    (misma oración/instrucción). Devuelve el set de rutas prohibidas —
+    hard-reject si el agente las modifica igual."""
+    if not criteria:
+        return set()
+    forbidden = set()
+    lower = criteria.lower()
+    for marker in _FORBID_MARKERS:
+        start = 0
+        while True:
+            idx = lower.find(marker, start)
+            if idx == -1:
+                break
+            # Ventana desde el marcador: el path prohibido aparece justo después
+            # ("no modifiques `src/server/auth/context.ts` en este ticket...").
+            window = criteria[idx: idx + 160]
+            paths = _re.findall(_FILE_PATH_RE, window)
+            if paths:
+                forbidden.add(paths[0])
+            start = idx + len(marker)
+    return forbidden
+
+
+def _is_out_of_scope(rel_path: str, mentioned_paths: set) -> bool:
+    """True si `rel_path` está fuera del árbol de directorios del ticket
+    (requerimiento 15, criterio 2): no fue mencionado y su directorio no es —
+    ni está bajo — el directorio de ningún archivo mencionado.
+
+    Solo tiene sentido cuando el requerimiento menciona al menos una ruta (hay
+    un "árbol esperado"); sin rutas mencionadas devuelve False (no romper
+    tickets exploratorios/vagos)."""
+    if not mentioned_paths or rel_path in mentioned_paths:
+        return False
+    rel_dir = os.path.dirname(rel_path)
+    mentioned_dirs = {os.path.dirname(p) for p in mentioned_paths if os.path.dirname(p)}
+    for md in mentioned_dirs:
+        if rel_dir == md or rel_dir.startswith(md + "/"):
+            return False  # dentro del dir de un archivo mencionado (o subdir)
+    return True
+
+
 def _find_allow_rewrite_files(criteria: str) -> set:
     """Extrae las rutas marcadas con `ALLOW_REWRITE: <ruta>` en el texto del
     requerimiento (requerimiento 13): opt-out explícito y determinístico de
@@ -601,16 +667,26 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
        requerimiento tiene lenguaje de excepción condicional (ej. "salvo que
        confirmes..."), se permite pero se registra como protección "soft"
        (solo warning en el log, no se rechaza).
+    5. El requerimiento lo prohíbe explícitamente por nombre ("no modifiques
+       X", "no toques X"…) — hard-reject (requerimiento 15, criterio 1).
+    6. Ya existe en disco y está fuera del árbol de directorios de los
+       archivos que el requerimiento sí mencionó (no fue mencionado, no es
+       companion de un test mencionado) — hard-reject para evitar regresiones
+       en código compartido no pedido (requerimiento 15, criterio 2). Solo
+       aplica si el requerimiento menciona al menos una ruta.
 
     Las guardas 1 y 2 (basadas en tamaño) se desactivan por archivo con la
     marca `ALLOW_REWRITE: <ruta>` en `criteria` (requerimiento 13): opt-out
     explícito para simplificaciones masivas intencionales, sin afectar a los
-    demás archivos del ciclo.
+    demás archivos del ciclo. `ALLOW_REWRITE` NO desactiva las guardas de
+    alcance (5 y 6) — son de otra naturaleza.
     """
     applied = []
     rejected = []
     protected_impl_files = _find_implicitly_protected_impl_files(criteria)
     allow_rewrite_files = _find_allow_rewrite_files(criteria)
+    forbidden_files = _find_explicitly_forbidden_files(criteria)
+    mentioned_paths = _mentioned_file_paths(criteria)
     # [^\n\r=]+ evita que el path capture newlines o el === de cierre
     # [ \t]*\r?\n? hace el salto de linea despues de === opcional
     pattern = r"===FILE_BEGIN:\s*([^\n\r=]+?)===[ \t]*\r?\n?(.*?)===FILE_END==="
@@ -635,6 +711,33 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
             else:
                 rel_path = rel_path.lstrip("/")
         full_path = os.path.join(workspace, rel_path)
+
+        # Guarda de exclusión explícita (req 15, criterio 1): el requerimiento
+        # prohibió tocar este archivo por nombre. Hard-reject.
+        if rel_path in forbidden_files:
+            reason = (
+                f"{rel_path}: el requerimiento prohíbe explícitamente modificar este "
+                f"archivo ('no modifiques/no toques …') — rechazado por guarda de "
+                f"exclusión explícita"
+            )
+            rejected.append(reason)
+            logger.warning("Archivo %s rechazado: prohibido explícitamente por el requerimiento", full_path)
+            continue
+
+        # Guarda de alcance por árbol de directorios (req 15, criterio 2): un
+        # archivo EXISTENTE fuera del árbol de los archivos mencionados, que
+        # nadie pidió tocar, es riesgo de regresión en código compartido.
+        # Se evalúa contra la ruta ya normalizada; los archivos nuevos no se
+        # bloquean acá (menos peligrosos; ver criterio 4, no implementado).
+        if os.path.exists(full_path) and _is_out_of_scope(rel_path, mentioned_paths):
+            reason = (
+                f"{rel_path}: archivo existente fuera del alcance del ticket (no "
+                f"mencionado en el requerimiento y fuera del árbol de directorios de "
+                f"los archivos que sí se mencionaron) — rechazado por guarda de alcance"
+            )
+            rejected.append(reason)
+            logger.warning("Archivo %s rechazado: fuera del árbol de directorios del ticket", full_path)
+            continue
 
         protection = protected_impl_files.get(rel_path)
         if protection == "hard":

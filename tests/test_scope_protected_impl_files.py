@@ -163,3 +163,125 @@ def test_sin_criteria_no_activa_ninguna_proteccion(real_fleet, tmp_path):
 
     assert applied == ["src/route.ts"]
     assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 15: exclusión explícita por nombre + archivos existentes fuera
+# del árbol de directorios del ticket (el req 11 no cubría ninguno de los dos).
+# ---------------------------------------------------------------------------
+
+def test_find_explicitly_forbidden_files_detecta_prohibicion_por_nombre(real_fleet):
+    criteria = (
+        "Migra las 5 rutas de mensajería a src/server/messages/message-service.ts.\n"
+        "No modifiques `src/server/auth/context.ts` en este ticket, incluso si "
+        "necesitas senderName — busca una alternativa dentro del propio service."
+    )
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/server/auth/context.ts" in forbidden
+
+
+def test_rechaza_archivo_prohibido_explicitamente_por_nombre(real_fleet, tmp_path):
+    """Criterio de aceptación 1: 'no modifiques X.ts' → hard-reject si el
+    agente lo toca igual (caso real: context.ts reescrito en los 6 ciclos)."""
+    ctx = tmp_path / "src" / "server" / "auth"
+    ctx.mkdir(parents=True)
+    original = "export interface ServerContext { userId: string; email?: string | null; }\n"
+    (ctx / "context.ts").write_text(original)
+
+    criteria = "Trabaja en messages. No toques src/server/auth/context.ts en este ticket."
+    llm_response = _file_block(
+        "src/server/auth/context.ts",
+        "export interface ServerContext { userId: string; name: string; email: string; }\n",
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == []
+    assert len(rejected) == 1
+    assert "context.ts" in rejected[0]
+    assert (ctx / "context.ts").read_text() == original  # intacto
+
+
+def test_rechaza_archivo_existente_fuera_del_arbol_del_ticket(real_fleet, tmp_path):
+    """Criterio de aceptación 2: errors.ts (archivo compartido existente, nunca
+    mencionado, fuera del dir del ticket) → hard-reject."""
+    (tmp_path / "src" / "server" / "messages").mkdir(parents=True)
+    errors = tmp_path / "src" / "server"
+    (errors / "errors.ts").write_text("export class AppError extends Error {}\n")
+
+    criteria = (
+        "Crea src/server/messages/message-service.ts y migra "
+        "src/app/api/messages/route.ts reutilizando src/lib/messages-service.ts."
+    )
+    # El agente toca errors.ts, jamás mencionado y fuera del árbol (dir src/server,
+    # no src/server/messages).
+    llm_response = _file_block(
+        "src/server/errors.ts",
+        "export class AppError extends Error { constructor(public code: string) { super(); } }\n",
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == []
+    assert len(rejected) == 1
+    assert "errors.ts" in rejected[0]
+
+
+def test_caso_exacto_del_hallazgo_prohibido_y_fuera_de_alcance_ambos_rechazados(real_fleet, tmp_path):
+    """Criterio de aceptación 3: reproduce el hallazgo — X prohibido por nombre
+    y Y fuera del dominio, en un mismo ciclo, ambos rechazados; el archivo
+    legítimamente dentro del dominio se escribe."""
+    # Estructura
+    (tmp_path / "src" / "server" / "auth").mkdir(parents=True)
+    (tmp_path / "src" / "server" / "messages").mkdir(parents=True)
+    (tmp_path / "src" / "app" / "api" / "mobile" / "classes").mkdir(parents=True)
+    (tmp_path / "src" / "server" / "auth" / "context.ts").write_text("export interface ServerContext {}\n")
+    (tmp_path / "src" / "app" / "api" / "mobile" / "classes" / "route.test.ts").write_text("test('x', () => {});\n")
+
+    criteria = (
+        "Crea src/server/messages/message-service.ts para el dominio de mensajería.\n"
+        "No modifiques src/server/auth/context.ts en este ticket."
+    )
+    llm_response = (
+        _file_block("src/server/messages/message-service.ts", "export function svc() {}\n")  # dentro de alcance
+        + "\n" + _file_block("src/server/auth/context.ts", "export interface ServerContext { name: string; }\n")  # prohibido
+        + "\n" + _file_block("src/app/api/mobile/classes/route.test.ts", "test('cambiado', () => {});\n")  # fuera de dominio, existente
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/server/messages/message-service.ts"]
+    assert len(rejected) == 2
+    assert any("context.ts" in r for r in rejected)
+    assert any("route.test.ts" in r for r in rejected)
+
+
+def test_archivo_nuevo_en_el_dir_del_ticket_no_se_bloquea_por_alcance(real_fleet, tmp_path):
+    """Caso negativo: un archivo NUEVO en el mismo directorio de un archivo
+    mencionado es plausible (no es una regresión en código compartido) y no
+    debe bloquearse por la guarda de alcance."""
+    (tmp_path / "src" / "server" / "messages").mkdir(parents=True)
+    criteria = "Crea src/server/messages/message-service.ts para mensajería."
+    # types.ts es nuevo, mismo dir que el archivo mencionado
+    llm_response = _file_block("src/server/messages/types.ts", "export type Msg = { id: string };\n")
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/server/messages/types.ts"]
+    assert rejected == []
+
+
+def test_requerimiento_sin_rutas_no_activa_guarda_de_alcance(real_fleet, tmp_path):
+    """Caso negativo: un requerimiento vago sin rutas específicas no define un
+    'árbol esperado' — la guarda de alcance no debe activarse (no romper
+    tickets exploratorios)."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "cualquier-cosa.ts").write_text("export const x = 1;\n")
+
+    criteria = "Mejora el manejo de errores de la app."  # sin rutas
+    llm_response = _file_block("src/cualquier-cosa.ts", "export const x = 2;\n")
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/cualquier-cosa.ts"]
+    assert rejected == []
