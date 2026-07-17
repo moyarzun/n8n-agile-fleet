@@ -561,6 +561,22 @@ def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
     return protected
 
 
+def _find_allow_rewrite_files(criteria: str) -> set:
+    """Extrae las rutas marcadas con `ALLOW_REWRITE: <ruta>` en el texto del
+    requerimiento (requerimiento 13): opt-out explícito y determinístico de
+    las guardas de tamaño (truncamiento + reescritura excesiva) para
+    simplificaciones masivas intencionales — ej. migrar ~150 líneas de lógica
+    inline a un adaptador delgado de ~20 líneas que llama a un servicio ya
+    extraído. Quien redacta el requerimiento (que ya revisó el plan) asume la
+    responsabilidad; la marca queda auditable en el log.
+
+    Solo desactiva las guardas basadas en tamaño; el resto (alcance del
+    requerimiento, chequeo cruzado Angular) sigue vigente."""
+    if not criteria:
+        return set()
+    return {m.strip() for m in _re.findall(r"ALLOW_REWRITE:\s*([^\n\r]+)", criteria)}
+
+
 def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = "") -> tuple:
     """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco.
 
@@ -585,10 +601,16 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
        requerimiento tiene lenguaje de excepción condicional (ej. "salvo que
        confirmes..."), se permite pero se registra como protección "soft"
        (solo warning en el log, no se rechaza).
+
+    Las guardas 1 y 2 (basadas en tamaño) se desactivan por archivo con la
+    marca `ALLOW_REWRITE: <ruta>` en `criteria` (requerimiento 13): opt-out
+    explícito para simplificaciones masivas intencionales, sin afectar a los
+    demás archivos del ciclo.
     """
     applied = []
     rejected = []
     protected_impl_files = _find_implicitly_protected_impl_files(criteria)
+    allow_rewrite_files = _find_allow_rewrite_files(criteria)
     # [^\n\r=]+ evita que el path capture newlines o el === de cierre
     # [ \t]*\r?\n? hace el salto de linea despues de === opcional
     pattern = r"===FILE_BEGIN:\s*([^\n\r=]+?)===[ \t]*\r?\n?(.*?)===FILE_END==="
@@ -632,7 +654,14 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
                 full_path,
             )
 
-        if os.path.exists(full_path):
+        allow_rewrite = rel_path in allow_rewrite_files
+        if allow_rewrite:
+            logger.info(
+                "Archivo %s: guardas de tamaño (truncamiento/reescritura) desactivadas "
+                "por marca ALLOW_REWRITE en el requerimiento", rel_path,
+            )
+
+        if os.path.exists(full_path) and not allow_rewrite:
             try:
                 with open(full_path, "r", errors="ignore") as fh:
                     original_text = fh.read()

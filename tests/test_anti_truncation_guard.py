@@ -189,6 +189,84 @@ def test_archivo_chico_reescrito_casi_entero_no_activa_guarda_de_reescritura(rea
     assert rejected == []
 
 
+# ---------------------------------------------------------------------------
+# Requerimiento 13: opt-out ALLOW_REWRITE por archivo para simplificaciones
+# masivas intencionales (adaptador delgado que llama a un servicio ya extraído).
+# ---------------------------------------------------------------------------
+
+def test_allow_rewrite_permite_simplificacion_masiva_de_archivo_marcado(real_fleet, tmp_path):
+    """Criterio de aceptación 1: un archivo con ALLOW_REWRITE en el
+    requerimiento se reescribe >30% sin ser rechazado."""
+    ruta = "src/app/api/portal/dashboard/route.ts"
+    target = tmp_path / "src" / "app" / "api" / "portal" / "dashboard"
+    target.mkdir(parents=True)
+    (target / "route.ts").write_text(
+        "\n".join(f"  const linea{i} = prismaQuery({i});" for i in range(150))
+    )
+
+    # Adaptador delgado: ~150 líneas de lógica inline → ~6 líneas que llaman al servicio.
+    adaptador = (
+        "export async function GET() {\n"
+        "  const data = await getStudentDashboard();\n"
+        "  return Response.json(data);\n"
+        "}\n"
+    )
+    criteria = (
+        f"Migra la ruta a un adaptador delgado que llame a getStudentDashboard.\n"
+        f"ALLOW_REWRITE: {ruta}"
+    )
+    llm_response = _file_block(ruta, adaptador)
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == [ruta]
+    assert rejected == []
+
+
+def test_allow_rewrite_es_por_archivo_otros_siguen_protegidos(real_fleet, tmp_path):
+    """Criterio de aceptación 3: en un mismo ciclo, el archivo con la marca se
+    aprueba y otro sin la marca (>30% de cambio) se rechaza — independientes."""
+    marcado = "src/app/api/mobile/dashboard/route.ts"
+    sin_marca = "src/server/payments/payment-service.ts"
+    for ruta in (marcado, sin_marca):
+        p = tmp_path / ruta
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(f"  const linea{i} = compute({i});" for i in range(150)))
+
+    criteria = (
+        f"Migra el dashboard a adaptador delgado y ajusta el payment-service.\n"
+        f"ALLOW_REWRITE: {marcado}"
+    )
+    thin = "export async function GET() { return Response.json(await getCoachDashboard()); }\n"
+    massive_rewrite = "\n".join(f"  const nuevo{i} = otraCosa({i});" for i in range(140))
+    llm_response = _file_block(marcado, thin) + "\n" + _file_block(sin_marca, massive_rewrite)
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == [marcado]
+    assert len(rejected) == 1
+    assert sin_marca in rejected[0]
+
+
+def test_sin_allow_rewrite_comportamiento_del_req_12_intacto(real_fleet, tmp_path):
+    """Criterio de aceptación 2: sin la marca, un archivo >30% sigue rechazado."""
+    ruta = "src/app/api/portal/dashboard/route.ts"
+    p = tmp_path / ruta
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(f"  const linea{i} = prismaQuery({i});" for i in range(150)))
+
+    thin = "export async function GET() { return Response.json(await getStudentDashboard()); }\n"
+    llm_response = _file_block(ruta, thin)
+    # criteria SIN ALLOW_REWRITE
+    criteria = "Migra la ruta a un adaptador delgado."
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == []
+    assert len(rejected) == 1
+    assert ruta in rejected[0]
+
+
 def test_rechaza_html_angular_que_referencia_metodo_inexistente_en_ts(real_fleet, tmp_path):
     """Criterio de aceptación 2 y 3: el .html referencia un método nuevo que el
     agente nunca agregó al .ts correspondiente — debe rechazarse."""
