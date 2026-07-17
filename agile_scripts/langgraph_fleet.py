@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.errors import GraphRecursionError  # re-exportado para fleet_api
+from langgraph.errors import GraphRecursionError, NodeError  # re-exportado para fleet_api
 from langgraph.func import task
 from langgraph.managed import RemainingSteps
 from langgraph.types import RetryPolicy
@@ -1423,19 +1423,39 @@ def planner_node(state: FleetState) -> dict:
         "Responde SOLO un array JSON de strings, sin texto extra."
     ))
     human = HumanMessage(content=f"TICKET:\n{criteria}\n\n{grounding}\n\nDevuelve el array JSON de subtareas.")
-    try:
+
+    def _plan_once() -> list:
         raw = _invoke_reviewer([sys, human])
         content = raw.content if hasattr(raw, "content") else str(raw)
         content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
         lo, hi = content.find("["), content.rfind("]")
         arr = _json.loads(content[lo:hi + 1]) if lo != -1 and hi > lo else []
-        subtasks = [str(x) for x in arr][:6]
-    except Exception as e:  # noqa: BLE001
-        _log(f"[planner] No se pudo descomponer ({e}); se usa el ticket completo")
-        subtasks = []
+        return [str(x) for x in arr][:6]
+
+    # Requerimiento 14: el planner devolvía 0 subtareas de forma silenciosa
+    # (fallo transitorio de parseo del modelo revisor, o array vacío) y el
+    # pipeline seguía sin guía. Un reintento cubre el caso transitorio; si
+    # persiste, se deja un aviso EXPLÍCITO y se continúa con el fallback
+    # intencional (el criteria completo) — tickets simples legítimamente no
+    # necesitan descomposición, por eso no se aborta.
+    subtasks: list = []
+    for attempt in (1, 2):
+        try:
+            subtasks = _plan_once()
+        except Exception as e:  # noqa: BLE001
+            _log(f"[planner] Intento {attempt}: no se pudo descomponer ({e})")
+            subtasks = []
+        if subtasks:
+            break
+        if attempt == 1:
+            _log("[planner] 0 subtareas en el primer intento — reintentando una vez")
 
     if subtasks:
         _log("[planner] Subtareas:\n" + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(subtasks)))
+    else:
+        _log("[planner] ⚠ AVISO: el planner no generó subtareas tras 2 intentos — se "
+             "procede con el ticket completo como guía (fallback). Si el ticket es "
+             "grande/complejo, considera dividirlo en despachos más chicos.")
     return {
         "subtasks": subtasks,
         "messages": [AIMessage(content=f"{len(subtasks)} subtareas planificadas", name="TechLead")],
@@ -2253,11 +2273,17 @@ def quality_gate_router(state: FleetState) -> str:
 # ===========================================================================
 # 8. Construccion del grafo
 # ===========================================================================
-def _node_error_handler(state, error) -> dict:
+def _node_error_handler(state, error: NodeError) -> dict:
     """Recuperación tras agotar los reintentos de un nodo (Req 4.3): en vez de
     una excepción que mata el worker con estado a medias, marca el fallo en el
     estado y deja que quality_gate_router desvíe al cierre ordenado — el
-    trabajo parcial queda commiteado en su rama para inspección."""
+    trabajo parcial queda commiteado en su rama para inspección.
+
+    IMPORTANTE (requerimiento 14): el parámetro `error` DEBE estar anotado con
+    `NodeError` — LangGraph inyecta el contexto del fallo por tipo de
+    anotación, no por posición. Sin la anotación, el handler se invoca como un
+    StateNode normal (solo `state`) y falla con "missing 1 required positional
+    argument: 'error'", enmascarando la excepción original."""
     node = getattr(error, "node", "?")
     err = getattr(error, "error", error)
     msg = f"ABORTADO: el nodo {node} falló tras agotar reintentos: {str(err)[:400]}"

@@ -45,6 +45,66 @@ def test_error_handler_escribe_aborted_y_feedback_con_nodo_y_mensaje(real_fleet)
     assert "disco lleno" in result["reviewer_feedback"]
 
 
+def test_error_handler_tiene_el_parametro_error_anotado_con_NodeError(real_fleet):
+    """Regresión requerimiento 14: LangGraph inyecta el contexto del fallo por
+    TIPO de anotación (NodeError), no por posición. Sin la anotación el handler
+    se invoca como StateNode normal (solo `state`) y crashea con "missing 1
+    required positional argument: 'error'", enmascarando la excepción real."""
+    import inspect
+    sig = inspect.signature(real_fleet._node_error_handler)
+    params = list(sig.parameters.values())
+    assert len(params) == 2
+    error_param = params[1]
+    ann = error_param.annotation
+    # La anotación debe ser NodeError (o su nombre, según cómo se resuelva).
+    ann_name = getattr(ann, "__name__", str(ann))
+    assert "NodeError" in ann_name
+
+
+def test_error_handler_real_se_invoca_sin_TypeError_al_fallar_un_nodo():
+    """Reproduce el crash del requerimiento 14 con el langgraph REAL: un nodo
+    que agota sus reintentos debe activar el error_handler global sin
+    'missing 1 required positional argument'."""
+    pytest.importorskip("langgraph.checkpoint.memory",
+                        reason="requiere langgraph real (corre dentro del contenedor)")
+    from langgraph.graph import StateGraph, START, END
+    from langgraph.types import RetryPolicy
+    from langgraph.errors import NodeError
+    from langgraph.checkpoint.memory import InMemorySaver
+    from typing_extensions import TypedDict
+
+    fleet = load_real_langgraph_fleet("langgraph_fleet_real_handler_e2e")
+
+    class S(TypedDict):
+        aborted: bool
+        reviewer_feedback: str
+        is_approved: bool
+        validation_passed: bool
+        messages: list
+
+    def boom(state):
+        raise RuntimeError("crash del nodo")
+
+    g = StateGraph(S)
+    g.set_node_defaults(
+        retry_policy=RetryPolicy(max_attempts=1),
+        error_handler=fleet._node_error_handler,
+    )
+    g.add_node("boom", boom)
+    g.add_edge(START, "boom")
+    g.add_edge("boom", END)
+    compiled = g.compile(checkpointer=InMemorySaver())
+
+    out = compiled.invoke(
+        {"aborted": False, "reviewer_feedback": "", "is_approved": False,
+         "validation_passed": False, "messages": []},
+        {"configurable": {"thread_id": "handler-e2e"}},
+    )
+    assert out["aborted"] is True
+    assert "boom" in out["reviewer_feedback"]
+    assert "crash del nodo" in out["reviewer_feedback"]
+
+
 def test_reviewer_hace_fast_reject_si_el_ciclo_esta_abortado(real_fleet):
     state = {
         "workspace_path": "/tmp/no-usado",
