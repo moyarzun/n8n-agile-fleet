@@ -1,8 +1,11 @@
 import os
+import shutil
 import subprocess
 import argparse
 import logging
 import threading
+import time
+import difflib
 import re as _re
 import json as _json
 from typing import TypedDict, Annotated, List, Dict, Optional, Callable
@@ -10,9 +13,15 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.errors import GraphRecursionError  # re-exportado para fleet_api
+from langgraph.func import task
+from langgraph.managed import RemainingSteps
+from langgraph.types import RetryPolicy
 from langchain_openai import ChatOpenAI
 from openai import RateLimitError, APIStatusError
 from atlassian import Jira
+
+import fleet_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +51,62 @@ JIRA_USERNAME      = os.getenv("JIRA_USER")
 JIRA_API_TOKEN     = os.getenv("JIRA_API_TOKEN")
 
 
+# ---------------------------------------------------------------------------
+# Checkpointer durable (spec langgraph-hardening, Req 1)
+# ---------------------------------------------------------------------------
+_checkpointer = None
+_checkpointer_lock = threading.Lock()
+
+
+def _get_checkpointer():
+    """Singleton de SqliteSaver sobre el volumen persistente. Lazy para que
+    importar este módulo (tests, tooling) no toque el filesystem."""
+    global _checkpointer
+    with _checkpointer_lock:
+        if _checkpointer is None:
+            import sqlite3
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            path = os.getenv("FLEET_CHECKPOINT_DB", "/data/n8n_store/checkpoints.db")
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # check_same_thread=False: los jobs corren en threads del
+            # ThreadPoolExecutor de fleet_api; el lock interno del saver
+            # serializa las escrituras.
+            conn = sqlite3.connect(path, check_same_thread=False)
+            _checkpointer = SqliteSaver(conn)
+        return _checkpointer
+
+
+def invoke_config(job_id: str) -> dict:
+    """Config de invocación compartida por fleet_api y el CLI: el thread_id
+    ata los checkpoints al job (Req 1.2) y el recursion_limit acota cualquier
+    ejecución desbocada (Req 7.1; cota real del grafo ≈35 super-steps)."""
+    return {"configurable": {"thread_id": job_id}, "recursion_limit": 60}
+
+
+def delete_job_checkpoints(job_id: str) -> None:
+    """Borra los checkpoints de un job terminado (Req 1.3) — cada checkpoint
+    incluye el estado completo (con contenido de archivos); sin limpieza el
+    archivo crecería sin cota. Best-effort: un fallo acá no debe romper el
+    cierre del job."""
+    try:
+        _get_checkpointer().delete_thread(job_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudieron borrar los checkpoints de %s: %s", job_id, e)
+
+
 def _is_quota_error(exc: Exception) -> bool:
     if isinstance(exc, RateLimitError):
         return True
     if isinstance(exc, APIStatusError) and exc.status_code in (402, 403, 429, 500, 502, 503, 529):
         return True
     msg = str(exc).lower()
-    return any(kw in msg for kw in ("429", "rate limit", "quota", "overload", "529", "capacity", "unavailable"))
+    return any(kw in msg for kw in (
+        "429", "rate limit", "quota", "overload", "529", "capacity", "unavailable",
+        "resourceexhausted", "resource exhausted", "request limit", "worker local total request limit",
+        "maximum context length", "context length", "context_length_exceeded",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +298,9 @@ ROLE_PLAYBOOKS_NODE = {
 }
 
 
-def _extract_token_usage(response: object, model_name: str) -> None:
-    """Emite una línea estructurada con el uso de tokens de la respuesta."""
+def _extract_token_usage(response: object, model_name: str) -> tuple:
+    """Emite una línea estructurada con el uso de tokens y devuelve
+    (input_tokens, output_tokens) para los atributos del span LLM (Req 6.4)."""
     try:
         inp = out = total = 0
         # LangChain >= 0.2: usage_metadata unificado
@@ -259,26 +318,57 @@ def _extract_token_usage(response: object, model_name: str) -> None:
             total = tu.get("total_tokens", inp + out) or (inp + out)
         if inp or out:
             _log(f"__TOKEN_USAGE__ {_json.dumps({'model': model_name, 'input': inp, 'output': out, 'total': total})}")
+        return inp, out
     except Exception:
-        pass
+        return 0, 0
+
+
+def _looks_like_gateway_error_page(content: str) -> bool:
+    """True si `content` es una página de error HTML de un CDN/edge (Akamai u
+    otro) en vez de la respuesta real del modelo — el proveedor upstream
+    estaba caído/rechazando requests a nivel de gateway, no un error de la
+    lógica del pipeline ni del código generado."""
+    if not content:
+        return False
+    stripped = content.strip().lower()
+    if stripped.startswith("<html") or stripped.startswith("<!doctype html"):
+        return True
+    return "an error occurred while processing your request" in stripped and "<body" in stripped
 
 
 def _invoke_chain(primary, fallback_chain: list, messages: list) -> object:
     candidates = [primary] + fallback_chain
     last_exc = None
     for model in candidates:
-        try:
-            response = model.invoke(messages)
-            model_name = getattr(model, "model_name", str(model))
-            _extract_token_usage(response, model_name)
-            return response
-        except Exception as exc:
-            if _is_quota_error(exc) or "404" in str(exc):
-                name = getattr(model, "model_name", str(model))
-                logger.warning("Modelo %s no disponible -> siguiente fallback", name)
-                last_exc = exc
-                continue
-            raise
+        model_name = getattr(model, "model_name", str(model))
+        for backoff in (0, 5, 15):
+            if backoff:
+                _log(f"[llm] {model_name}: reintentando tras error de gateway del proveedor (backoff {backoff}s)...")
+                time.sleep(backoff)
+            try:
+                cycle = getattr(_thread_local, "current_cycle", 0)
+                with fleet_tracing.llm_span(model_name, cycle) as span:
+                    response = model.invoke(messages)
+                    content = getattr(response, "content", "") or ""
+                    if _looks_like_gateway_error_page(content):
+                        last_exc = RuntimeError(
+                            f"Error del proveedor del modelo: el gateway de {model_name} devolvió "
+                            f"una página de error (no JSON) en vez de la respuesta del modelo: "
+                            f"{content.strip()[:200]}"
+                        )
+                        logger.warning("Modelo %s devolvió página de error de gateway (reintento con backoff=%ds)", model_name, backoff)
+                        continue
+                    inp_tokens, out_tokens = _extract_token_usage(response, model_name)
+                    fleet_tracing.set_llm_span_tokens(span, inp_tokens, out_tokens)
+                    return response
+            except Exception as exc:
+                if _is_quota_error(exc) or "404" in str(exc):
+                    logger.warning("Modelo %s no disponible -> siguiente fallback", model_name)
+                    last_exc = exc
+                    break  # no reintentar este modelo — pasar directo al siguiente de la cadena
+                raise
+        else:
+            continue  # se agotaron los reintentos de error de gateway para este modelo — probar el siguiente
     raise RuntimeError(f"Todos los modelos fallaron. Ultimo error: {last_exc}") from last_exc
 
 
@@ -393,13 +483,120 @@ def _get_workspace_context(workspace: str, hint_dirs: list = None,
     return "\n".join(context_parts)
 
 
-def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
-    """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco."""
+# Requerimiento 08: chequeo cruzado liviano entre un componente Angular
+# X.html y su X.ts — detecta cuando el template referencia un método/símbolo
+# que el agente nunca agregó al componente (regeneró solo uno de los dos
+# archivos relacionados, o alucinó una estructura distinta que llama a un
+# método inexistente). Es un chequeo por regex, no requiere compilar Angular.
+_ANGULAR_TEMPLATE_EXPR_RE = _re.compile(
+    r"\{\{(.*?)\}\}"                      # interpolación {{ ... }}
+    r"|\*ng\w+\s*=\s*\"([^\"]*)\""        # directivas estructurales *ngIf/*ngFor
+    r"|\[[\w.\-]+\]\s*=\s*\"([^\"]*)\"",  # property binding [x]="expr"
+    _re.DOTALL,
+)
+_METHOD_CALL_RE = _re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
+_ANGULAR_TEMPLATE_BUILTINS = {
+    "if", "for", "switch", "case", "let", "as",
+    "true", "false", "null", "undefined", "this",
+}
+
+
+def _extract_template_method_calls(html_content: str) -> set:
+    calls = set()
+    for m in _ANGULAR_TEMPLATE_EXPR_RE.finditer(html_content):
+        expr = next((g for g in m.groups() if g is not None), "")
+        for call_m in _METHOD_CALL_RE.finditer(expr):
+            name = call_m.group(1)
+            if name not in _ANGULAR_TEMPLATE_BUILTINS:
+                calls.add(name)
+    return calls
+
+
+def _method_exists_in_ts(name: str, ts_content: str) -> bool:
+    return bool(_re.search(r"\b" + _re.escape(name) + r"\s*\(", ts_content))
+
+
+# Requerimiento 11: el agente modificaba archivos de implementación que el
+# requerimiento nunca autorizó tocar — ej. "ajusta el TEST, no la
+# implementación" para X.test.ts, y el agente reescribía X.ts igual; o el
+# requerimiento solo mencionaba X.test.ts y el agente tocó X.ts sin que nadie
+# lo pidiera. Frases que indican que el requerimiento SÍ contempla
+# explícitamente una excepción condicional para tocar la implementación
+# (ej. "...salvo que confirmes que la implementación tiene el bug real") —
+# en ese caso no se bloquea automáticamente, solo se deja visible en el log
+# para que el reviewer le preste atención extra.
+_SCOPE_EXCEPTION_MARKERS = ("salvo que", "excepto si", "a menos que", "salvo si", "a no ser que")
+
+
+def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
+    """Deriva, del texto libre del requerimiento, qué archivos de
+    implementación NO están autorizados a modificarse: el companion de
+    implementación (`X.ts`) de un archivo de test (`X.test.ts`/`X.spec.ts`)
+    mencionado en el texto, cuando ese companion nunca se menciona por su
+    cuenta en ningún otro lugar del requerimiento.
+
+    Devuelve {ruta_implementacion: "hard" | "soft"}. "hard" = no hay ningún
+    lenguaje de excepción condicional en el texto, se rechaza el ciclo si se
+    toca. "soft" = sí hay lenguaje de excepción (ver _SCOPE_EXCEPTION_MARKERS),
+    no se bloquea automáticamente, solo se registra para el reviewer.
+    """
+    if not criteria:
+        return {}
+    protected: Dict[str, str] = {}
+    criteria_lower = criteria.lower()
+    has_exception_language = any(marker in criteria_lower for marker in _SCOPE_EXCEPTION_MARKERS)
+    test_paths = set(_re.findall(r"[\w/\-\.]+\.(?:test|spec)\.tsx?", criteria))
+    for test_path in test_paths:
+        impl_path = _re.sub(r"\.(test|spec)\.", ".", test_path, count=1)
+        # El companion cuenta como "mencionado" solo si aparece en el texto
+        # en una posición DISTINTA a la del propio test_path (para no
+        # confundir "X.test.ts" consigo mismo si compartiera substring).
+        other_mentions = [
+            m.start() for m in _re.finditer(_re.escape(impl_path), criteria)
+            if criteria[m.start(): m.start() + len(test_path)] != test_path
+        ]
+        if other_mentions:
+            continue  # el requerimiento sí menciona la implementación aparte
+        protected[impl_path] = "soft" if has_exception_language else "hard"
+    return protected
+
+
+def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = "") -> tuple:
+    """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco.
+
+    Devuelve (applied, rejected). Un archivo se rechaza (no se escribe) si:
+    1. Ya existe, es "grande" (>500 líneas o >20KB) y el contenido propuesto
+       perdió >30% de líneas/bytes — señal de truncamiento (requerimiento 06).
+    2. Ya existe, tiene >100 líneas, y el contenido propuesto cambió >30% de
+       las líneas aunque el tamaño no se haya achicado — señal de reescritura
+       completa no solicitada, el patrón más sutil del requerimiento 08 (el
+       modelo "alucina" una versión distinta del archivo en vez de aplicar el
+       cambio puntual pedido; el guard de tamaño de arriba no lo detecta
+       porque el archivo resultante tiene un tamaño similar). Umbral bajado
+       de 80% a 30% por el requerimiento 12 (un cambio real de ~65% pasó sin
+       detectarse con el umbral anterior).
+    3. Es un `.html` de Angular que referencia (vía `{{ }}`/`*ngIf`/binding)
+       un método que no existe en su `.ts` correspondiente (ni en el nuevo
+       contenido de este mismo ciclo, ni en el que ya está en disco) — señal
+       de que el agente tocó un archivo del par sin coordinar el otro.
+    4. Es un archivo de implementación cuyo companion de test SÍ fue
+       mencionado en `criteria` pero el archivo de implementación en sí
+       nunca se mencionó (ver requerimiento 11) — protección "hard". Si el
+       requerimiento tiene lenguaje de excepción condicional (ej. "salvo que
+       confirmes..."), se permite pero se registra como protección "soft"
+       (solo warning en el log, no se rechaza).
+    """
     applied = []
+    rejected = []
+    protected_impl_files = _find_implicitly_protected_impl_files(criteria)
     # [^\n\r=]+ evita que el path capture newlines o el === de cierre
     # [ \t]*\r?\n? hace el salto de linea despues de === opcional
     pattern = r"===FILE_BEGIN:\s*([^\n\r=]+?)===[ \t]*\r?\n?(.*?)===FILE_END==="
     matches = _re.findall(pattern, llm_response, _re.DOTALL)
+
+    # Primera pasada: normalizar rutas/contenido y aplicar las guardas de
+    # tamaño/reescritura. `candidates` acumula lo que pasó estas guardas.
+    candidates: Dict[str, str] = {}
     for rel_path, content in matches:
         rel_path = rel_path.strip()
         # Si el modelo uso \n literal en lugar de newlines reales, desescapar
@@ -416,6 +613,118 @@ def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
             else:
                 rel_path = rel_path.lstrip("/")
         full_path = os.path.join(workspace, rel_path)
+
+        protection = protected_impl_files.get(rel_path)
+        if protection == "hard":
+            reason = (
+                f"{rel_path}: el requerimiento no autorizó modificar este archivo de "
+                f"implementación (solo mencionaba su test) — rechazado por guarda de "
+                f"alcance no autorizado"
+            )
+            rejected.append(reason)
+            logger.warning("Archivo %s rechazado: fuera del alcance autorizado por el requerimiento", full_path)
+            continue
+        elif protection == "soft":
+            logger.warning(
+                "Archivo %s modificado pese a que el requerimiento solo mencionaba su "
+                "test explícitamente — permitido por lenguaje de excepción condicional "
+                "en el requerimiento, pero requiere atención extra del reviewer",
+                full_path,
+            )
+
+        if os.path.exists(full_path):
+            try:
+                with open(full_path, "r", errors="ignore") as fh:
+                    original_text = fh.read()
+            except OSError:
+                original_text = ""
+            original_lines_list = original_text.splitlines()
+            original_lines = len(original_lines_list)
+            original_size = len(original_text.encode("utf-8", errors="ignore"))
+            new_lines_list = content.splitlines()
+            new_lines = len(new_lines_list)
+            new_size = len(content.encode("utf-8", errors="ignore"))
+
+            is_large = original_lines > 500 or original_size > 20_000
+            shrank_a_lot = (
+                original_lines > 0 and new_lines < original_lines * 0.7
+            ) or (
+                original_size > 0 and new_size < original_size * 0.7
+            )
+            if is_large and shrank_a_lot:
+                reason = (
+                    f"{rel_path}: original {original_lines} líneas/{original_size}B "
+                    f"→ propuesto {new_lines} líneas/{new_size}B "
+                    f"(pérdida >30%, rechazado por guarda anti-truncamiento)"
+                )
+                rejected.append(reason)
+                logger.warning(
+                    "Archivo %s rechazado: encogió de %d a %d líneas (posible "
+                    "truncamiento/reescritura no solicitada del LLM)",
+                    full_path, original_lines, new_lines,
+                )
+                continue  # no escribir este archivo
+
+            if original_lines > 100:
+                similarity = difflib.SequenceMatcher(None, original_lines_list, new_lines_list).ratio()
+                # Umbral alineado con el resto de las guardas (>30% cambiado, ver
+                # requerimiento 12): un primer umbral de >80% dejó pasar sin
+                # detectar una reescritura real de ~65% en payment-service.ts que
+                # introdujo regresiones (se eliminó un límite de paginación,
+                # includes de Prisma, el tipo Zod compartido, y el helper de
+                # autorización reusable) — el rechazo conservador cuesta un ciclo
+                # extra de iteración, pero es preferible a aprobar eso en silencio.
+                if similarity < 0.70:
+                    changed_pct = round((1 - similarity) * 100)
+                    reason = (
+                        f"{rel_path}: ~{changed_pct}% del archivo cambiado "
+                        f"(rechazado por guarda de reescritura excesiva — el cambio "
+                        f"pedido no debería requerir reescribir el archivo casi entero)"
+                    )
+                    rejected.append(reason)
+                    logger.warning(
+                        "Archivo %s rechazado: reescritura excesiva (similaridad %.0f%%)",
+                        full_path, similarity * 100,
+                    )
+                    continue
+
+        candidates[rel_path] = content
+
+    # Segunda pasada: chequeo cruzado Angular .ts/.html sobre lo que sobrevivió
+    # a las guardas de arriba.
+    for rel_path in list(candidates.keys()):
+        if not rel_path.endswith(".html"):
+            continue
+        calls = _extract_template_method_calls(candidates[rel_path])
+        if not calls:
+            continue
+        ts_rel_path = rel_path[: -len(".html")] + ".ts"
+        ts_content = candidates.get(ts_rel_path)
+        if ts_content is None:
+            ts_full_path = os.path.join(workspace, ts_rel_path)
+            if not os.path.exists(ts_full_path):
+                continue  # no hay .ts correspondiente — no es un componente Angular típico
+            try:
+                with open(ts_full_path, "r", errors="ignore") as fh:
+                    ts_content = fh.read()
+            except OSError:
+                ts_content = ""
+        missing = [name for name in sorted(calls) if not _method_exists_in_ts(name, ts_content)]
+        if missing:
+            reason = (
+                f"{rel_path}: el template referencia {', '.join(missing)} pero no "
+                f"existe en {ts_rel_path} (rechazado por chequeo cruzado .ts/.html)"
+            )
+            rejected.append(reason)
+            logger.warning(
+                "Archivo %s rechazado: referencia símbolos inexistentes en %s: %s",
+                rel_path, ts_rel_path, missing,
+            )
+            del candidates[rel_path]
+
+    # Tercera pasada: escribir al disco solo lo que sobrevivió a todas las guardas.
+    for rel_path, content in candidates.items():
+        full_path = os.path.join(workspace, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         # Eliminar antes de escribir para evitar deadlock VirtioFS (Errno 35):
         # los archivos existentes en volúmenes macOS heredan xattrs que bloquean escritura.
@@ -428,7 +737,7 @@ def _apply_workspace_changes(workspace: str, llm_response: str) -> list:
             fh.write(content)
         applied.append(rel_path)
         logger.info("Archivo escrito: %s", full_path)
-    return applied
+    return applied, rejected
 
 
 # ===========================================================================
@@ -519,7 +828,51 @@ def _rails_grounding(workspace: str, criteria: str, max_bytes: int = 6000) -> st
             + "\n".join(parts))
 
 
-def _validate_workspace(workspace: str, applied_files: list, stack: str = "generic") -> tuple:
+def _extract_failing_tests(vitest_output: str) -> set:
+    """Extrae identificadores únicos de tests que fallaron de la salida verbose
+    de `vitest run` (líneas 'FAIL <archivo> > describe > test'). Se usa para
+    comparar qué falla ANTES vs DESPUÉS de que dynamic_developer edite código
+    (ver requerimiento 10: un ticket acotado no debe rechazarse por fallos
+    preexistentes no relacionados en otra parte del repo)."""
+    failing = set()
+    for line in vitest_output.splitlines():
+        line = line.strip()
+        if line.startswith("FAIL"):
+            ident = line[len("FAIL"):].strip()
+            if ident:
+                failing.add(ident)
+    return failing
+
+
+def _run_vitest_baseline(workspace: str, stack: str) -> Optional[set]:
+    """Corre `vitest run` UNA vez, antes de que dynamic_developer toque nada,
+    para saber qué tests ya fallaban de antemano. Devuelve None si vitest no
+    aplica a este proyecto (no hay vitest.config, o no es stack node) — en
+    ese caso _validate_workspace no puede distinguir preexistente de nuevo y
+    cae al comportamiento estricto anterior (cualquier fallo bloquea)."""
+    if stack != "node" or not _tool_available("npx"):
+        return None
+    has_vitest_config = os.path.exists(os.path.join(workspace, "vitest.config.ts")) or \
+                        os.path.exists(os.path.join(workspace, "vitest.config.js"))
+    if not has_vitest_config:
+        return None
+    rc, out = _run(
+        ["node", "--max-old-space-size=2048", "./node_modules/.bin/vitest",
+         "run", "--reporter=verbose"],
+        cwd=workspace,
+        timeout=int(os.getenv("FLEET_VITEST_TIMEOUT", "180")),
+    )
+    if "Cannot find module" in out and "vitest" in out:
+        return None  # vitest no instalado — _validate_workspace ya avisa de esto por su cuenta
+    if rc == 0:
+        return set()
+    return _extract_failing_tests(out)
+
+
+def _validate_workspace(
+    workspace: str, applied_files: list, stack: str = "generic",
+    baseline_failing_tests: Optional[set] = None,
+) -> tuple:
     """Validación DETERMINISTA del código generado. Devuelve (passed, reporte).
 
     Niveles (best-effort según herramientas disponibles en el contenedor):
@@ -642,6 +995,27 @@ def _validate_workspace(workspace: str, applied_files: list, stack: str = "gener
                 summary_match = _re.search(r'Test Files.*\n?.*Tests\s+\d+', out)
                 summary = summary_match.group(0).strip() if summary_match else f"exit 0"
                 report.append(f"VITEST (npx vitest run): ✓ {summary}\n{tail[-800:]}")
+            elif baseline_failing_tests is not None:
+                # Requerimiento 10: aprobar por alcance del ticket, no exigir que
+                # TODA la suite esté verde. Solo bloquear si aparecen fallos
+                # NUEVOS que no estaban ya presentes antes de este despacho.
+                current_failing = _extract_failing_tests(out)
+                new_failures = current_failing - baseline_failing_tests
+                preexisting_still_failing = current_failing & baseline_failing_tests
+                if new_failures:
+                    ok = False
+                    report.append(
+                        f"VITEST (npx vitest run): ✗ {len(new_failures)} fallo(s) NUEVO(S) "
+                        f"introducido(s) por este cambio (no relacionado con fallos "
+                        f"preexistentes):\n" + "\n".join(sorted(new_failures)[:20])
+                    )
+                else:
+                    report.append(
+                        f"VITEST (npx vitest run): ✓ sin fallos nuevos "
+                        f"({len(preexisting_still_failing)} fallo(s) preexistente(s) "
+                        f"no relacionados con este ticket, ya presentes antes del despacho, "
+                        f"ignorados)\n{tail[-800:]}"
+                    )
             else:
                 ok = False
                 report.append(f"VITEST (npx vitest run): ✗ exit {rc}\n{tail}")
@@ -695,9 +1069,11 @@ class FleetState(TypedDict):
     required_agents:     List[str]
     current_code_diff:   Dict[str, str]
     applied_files:       List[str]   # rutas relativas escritas al disco en todos los ciclos
+    rejected_files:      List[str]   # archivos rechazados por la guarda anti-truncamiento (no escritos)
     reviewer_feedback:   str
     is_approved:         bool
     loop_iterations:     int
+    aborted:             bool        # True si git_setup abortó (sin repo git / árbol sucio)
     # ── GitFlow + validación + planificación ──
     stack:               str         # rails | flutter | node | generic
     base_branch:         str         # rama base (main/develop) sobre la que se ramifica
@@ -705,6 +1081,7 @@ class FleetState(TypedDict):
     subtasks:            List[str]   # descomposición del ticket (planner)
     validation_report:   str         # salida determinista (ruby -c / tests)
     validation_passed:   bool        # gate determinista
+    validation_baseline_failing_tests: Optional[List[str]]  # tests que ya fallaban ANTES del despacho (None si no aplica/no se pudo capturar)
     pr_url:              str         # URL del PR si se abrió
     existing_files:      Dict[str, str]  # contenido de archivos existentes antes de modificar
     regression_errors:   List[str]       # elementos eliminados detectados por regression_guard
@@ -712,6 +1089,8 @@ class FleetState(TypedDict):
     staging_url:         str         # URL del deploy de staging (Vercel preview o STAGING_BASE_URL)
     staging_passed:      bool        # True si los smoke/E2E de staging pasaron (o si staging no está configurado)
     staging_report:      str         # salida del staging_tester_node
+    # ── Límite de recursión (spec langgraph-hardening, Req 7.3) ──
+    remaining_steps:     RemainingSteps  # super-steps restantes antes del recursion_limit (managed value)
 
 
 class ReviewerDecision(BaseModel):
@@ -831,46 +1210,151 @@ def fetch_and_plan_node(state: FleetState) -> dict:
     }
 
 
-def git_setup_node(state: FleetState) -> dict:
-    """GitFlow: crea una rama de trabajo aislada por ticket. NUNCA se trabaja en main.
+def _abort(reason: str) -> dict:
+    """Corta la ejecución del grafo en git_setup con un motivo claro.
 
-    Determina la rama base (main/develop) y crea fleet/<ticket>-<slug> desde ella.
-    Si el workspace no es repo git, degrada a modo sin-git (avisa) y continúa.
+    Setea 'aborted' (usado por la arista condicional post-git_setup para saltar
+    directo a END) y también 'is_approved'/'reviewer_feedback' para que el
+    resultado final del job (fleet_api._run_fleet_worker) muestre el motivo
+    real en vez de un rechazo genérico.
+    """
+    _log(f"[git_setup] {reason}")
+    return {
+        "aborted":            True,
+        "base_branch":        "",
+        "work_branch":        "",
+        "is_approved":        False,
+        "validation_passed":  False,
+        "reviewer_feedback":  reason,
+        "messages":           [AIMessage(content=reason, name="GitOps")],
+    }
+
+
+def git_setup_node(state: FleetState) -> dict:
+    """GitFlow: crea un worktree aislado por ticket. NUNCA se trabaja en main
+    ni se comparte working tree entre tareas concurrentes.
+
+    ABORTA la ejecución completa (no degrada ni continúa) si:
+      - el workspace no es un repositorio git (o git no está disponible), o
+      - el árbol de trabajo tiene cambios sin commitear.
+
+    Usa `git worktree add` en vez de `git checkout -B`: cada tarea recibe su
+    propio directorio físico checkouteado a su propia rama, compartiendo el
+    mismo `.git` — así múltiples tareas pueden correr en paralelo sobre el
+    mismo repo sin pisarse el working tree entre sí.
     """
     workspace = state["workspace_path"]
     ticket    = state["ticket_id"]
 
     if not _tool_available("git") or not _is_git_repo(workspace):
-        _log("[git_setup] AVISO: workspace no es repo git o git no disponible → modo sin-git")
-        return {"base_branch": "", "work_branch": "",
-                "messages": [AIMessage(content="git no disponible; sin aislamiento por rama", name="GitOps")]}
+        return _abort(
+            "ABORTADO: el workspace no es un repositorio git (o git no está "
+            "disponible). La Flota nunca opera sobre directorios sin control "
+            "de versiones — no hay red de seguridad para revertir cambios. "
+            "Inicializa el repo (git init + primer commit) ANTES de invocar "
+            "la Flota."
+        )
 
-    # Rama base: develop si existe (GitFlow), si no la rama por defecto del repo.
-    rc, out = _git(["rev-parse", "--verify", "develop"], workspace)
-    if rc == 0:
-        base = "develop"
+    rc, out = _git(["status", "--porcelain"], workspace)
+    if rc == 0 and out.strip():
+        return _abort(
+            "ABORTADO: el árbol de trabajo tiene cambios sin commitear. La "
+            "Flota ya no hace `git stash` (ocultaba cambios del usuario sin "
+            "restaurarlos). Commitea o descarta tus cambios antes de invocar "
+            "la Flota.\n\ngit status --porcelain:\n" + out.strip()[:500]
+        )
+
+    # Rama base: la que esté actualmente checked out en el workspace (así el
+    # trabajo despachado se apila sobre la rama activa del usuario, no
+    # siempre sobre develop/main). Si HEAD está detached, cae al
+    # comportamiento anterior (develop si existe, si no la rama por defecto).
+    rc, out = _git(["symbolic-ref", "--short", "HEAD"], workspace)
+    if rc == 0 and out.strip():
+        base = out.strip()
     else:
-        rc, out = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], workspace)
-        base = out.strip().split("/")[-1] if rc == 0 and out.strip() else "main"
+        rc, out = _git(["rev-parse", "--verify", "develop"], workspace)
+        if rc == 0:
+            base = "develop"
+        else:
+            rc, out = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], workspace)
+            base = out.strip().split("/")[-1] if rc == 0 and out.strip() else "main"
 
     slug   = _slugify(state.get("acceptance_criteria", "").split("\n")[0].replace("TITULO:", ""))
     branch = f"fleet/{ticket}-{slug}"
 
-    # Asegurar árbol limpio y partir desde la base actualizada.
-    _git(["stash", "-u"], workspace)
-    _git(["checkout", base], workspace)
-    _git(["pull", "--ff-only"], workspace, timeout=120)
-    rc, out = _git(["checkout", "-B", branch, base], workspace)
-    if rc != 0:
-        _log(f"[git_setup] No se pudo crear rama {branch}: {out.strip()[:160]}")
-        return {"base_branch": base, "work_branch": "",
-                "messages": [AIMessage(content=f"No se pudo ramificar: {out.strip()[:120]}", name="GitOps")]}
+    # Worktree aislado como sibling del repo (NUNCA dentro del propio workspace
+    # montado), para no ensuciar el árbol que el usuario ve y permitir que
+    # varias tareas corran en paralelo sin compartir working tree.
+    repo_name     = os.path.basename(workspace.rstrip("/")) or "repo"
+    worktree_root = os.path.join(os.path.dirname(workspace.rstrip("/")), ".fleet-worktrees")
+    worktree_path = os.path.join(worktree_root, f"{repo_name}-{ticket}-{slug}")
+    os.makedirs(worktree_root, exist_ok=True)
 
-    _log(f"[git_setup] Rama de trabajo: {branch} (base: {base})")
+    # Si quedó un worktree de un intento anterior con el mismo nombre, limpiarlo.
+    if os.path.exists(worktree_path):
+        _git(["worktree", "remove", "--force", worktree_path], workspace)
+        _git(["worktree", "prune"], workspace)
+        shutil.rmtree(worktree_path, ignore_errors=True)
+
+    # Traer la base más reciente sin tocar el checkout compartido: el worktree
+    # nuevo parte de origin/<base> si el fetch funcionó (repo con remoto), o de
+    # la base local como fallback (repo sin remoto / fetch falló).
+    fetch_rc, _ = _git(["fetch", "origin", base], workspace, timeout=120)
+    base_ref = f"origin/{base}" if fetch_rc == 0 else base
+
+    rc, out = _git(["worktree", "add", "-B", branch, worktree_path, base_ref], workspace)
+    if rc != 0:
+        return _abort(f"ABORTADO: no se pudo crear el worktree {worktree_path}: {out.strip()[:300]}")
+
+    _log(f"[git_setup] Worktree aislado: {worktree_path} en rama {branch} (base: {base})")
+
+    # Los worktrees de git nunca comparten node_modules (está en .gitignore).
+    # Instalar dependencias acá para que tsc/vitest existan en la validación.
+    if os.path.exists(os.path.join(worktree_path, "package.json")):
+        install_rc, install_out = _run(["npm", "install"], cwd=worktree_path, timeout=300)
+        if install_rc != 0:
+            # Un solo reintento antes de abortar — cubre fallos transitorios
+            # (contención de red/cache si hay varios despachos concurrentes
+            # sobre el mismo repo).
+            _log(f"[git_setup] npm install falló, reintentando una vez: {install_out.strip()[:200]}")
+            install_rc, install_out = _run(["npm", "install"], cwd=worktree_path, timeout=300)
+
+        if install_rc != 0:
+            _git(["worktree", "remove", "--force", worktree_path], workspace)
+            _git(["worktree", "prune"], workspace)
+            shutil.rmtree(worktree_path, ignore_errors=True)
+            return _abort(
+                f"ABORTADO: npm install falló dos veces en el worktree nuevo. "
+                f"No tiene sentido continuar con dependencias parcialmente "
+                f"instaladas — los ciclos de validación fallarían de forma "
+                f"confusa sin indicar la causa real.\n\n{install_out.strip()[:500]}"
+            )
+
+        _log(f"[git_setup] npm install: ✓ OK ({install_out.strip()[:200]})")
+
+    # Baseline de tests ANTES de que dynamic_developer edite nada (requerimiento
+    # 10): permite que validation_gate distinga fallos preexistentes (no deben
+    # bloquear un ticket acotado) de regresiones nuevas introducidas por este
+    # despacho. None si vitest no aplica a este proyecto.
+    stack = state.get("stack", "generic")
+    baseline_failing_tests = _run_vitest_baseline(worktree_path, stack)
+    if baseline_failing_tests is not None:
+        _log(f"[git_setup] Baseline de tests: {len(baseline_failing_tests)} fallo(s) preexistente(s) antes del despacho")
+
     return {
-        "base_branch": base,
-        "work_branch": branch,
-        "messages": [AIMessage(content=f"Rama de trabajo {branch} creada desde {base}", name="GitOps")],
+        "workspace_path": worktree_path,
+        "base_branch":    base,
+        "work_branch":    branch,
+        # None (no lista vacía) cuando vitest no aplica — distingue "no hay
+        # baseline disponible" (cae al comportamiento estricto anterior) de
+        # "baseline capturado y no había ningún fallo preexistente".
+        "validation_baseline_failing_tests": (
+            sorted(baseline_failing_tests) if baseline_failing_tests is not None else None
+        ),
+        "messages": [AIMessage(
+            content=f"Worktree {worktree_path} creado en rama {branch} desde {base}",
+            name="GitOps",
+        )],
     }
 
 
@@ -940,10 +1424,16 @@ def codebase_reader_node(state: FleetState) -> dict:
     subtasks  = state.get("subtasks", [])
     criteria  = state.get("acceptance_criteria", "")
 
-    # Extraer rutas mencionadas en subtasks y criterios
+    # Extraer rutas mencionadas en subtasks y criterios. Incluye `.md`: los
+    # requerimientos en modo libre suelen referenciar un archivo de plan
+    # (ej. `docs/superpowers/plans/*.md`) pidiéndole al agente que "lo lea" —
+    # sin esto, ese plan NUNCA se lee de verdad ni se inyecta en el prompt del
+    # LLM (una llamada de completion, no un agente con herramientas de
+    # filesystem), y el modelo termina alucinando una versión propia del
+    # contenido a partir del nombre/descripción (ver requerimiento 08).
     text = "\n".join(subtasks) + "\n" + criteria
     found = _re.findall(
-        r'[\w/\-\.]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml)',
+        r'[\w/\-\.]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml|md)',
         text
     )
     candidates = list(dict.fromkeys(
@@ -974,57 +1464,86 @@ def codebase_reader_node(state: FleetState) -> dict:
 
 
 def regression_guard_node(state: FleetState) -> dict:
-    """Verifica que los archivos generados no eliminaron contenido existente.
+    """Verifica que los archivos generados no eliminaron contenido existente,
+    y RESTAURA de inmediato cualquier archivo donde detecte una regresión.
 
-    Corre DESPUÉS del dynamic_developer y ANTES de validation_gate. Si detecta
-    regresiones (modelos/campos/exports eliminados), pone validation_passed=False
-    y un reporte detallado que el developer recibirá en el próximo ciclo.
+    Corre DESPUÉS del dynamic_developer y ANTES de validation_gate. Antes, una
+    regresión detectada solo marcaba validation_passed=False y dejaba el
+    archivo roto en disco mientras el ciclo de corrección lo intentaba
+    arreglar — si el ciclo se agotaba sin éxito, el archivo truncado quedaba
+    así permanentemente. Ahora, apenas se detecta una regresión en un archivo,
+    ese archivo se restaura a su contenido previo a este ciclo (capturado por
+    codebase_reader_node) ANTES de reportar el problema al developer — el
+    working tree nunca queda peor de lo que estaba, sin importar cuántos
+    ciclos de corrección hagan falta o si se agotan sin éxito.
+
+    Nota: existing_files trunca a 80.000 caracteres (ver codebase_reader_node);
+    para archivos más grandes que eso, la restauración también sería parcial.
     """
     workspace      = state["workspace_path"]
     existing_files = state.get("existing_files", {})
     applied_files  = set(state.get("applied_files", []))
 
     issues: List[str] = []
+    restored: List[str] = []
 
     for rel, old_content in existing_files.items():
         if rel not in applied_files:
             continue  # archivo no tocado — sin riesgo
 
         full = os.path.join(workspace, rel)
+        file_issues: List[str] = []
+
         if not os.path.exists(full):
-            issues.append(f"ELIMINADO: {rel} fue borrado por el generador")
-            continue
+            file_issues.append(f"ELIMINADO: {rel} fue borrado por el generador")
+        else:
+            try:
+                with open(full, errors="replace") as fh:
+                    new_content = fh.read()
+            except Exception:
+                continue
 
-        try:
-            with open(full, errors="replace") as fh:
-                new_content = fh.read()
-        except Exception:
-            continue
+            if rel.endswith("schema.prisma"):
+                file_issues.extend(_check_prisma_regression(old_content, new_content))
+            elif rel.endswith((".ts", ".tsx", ".js")):
+                file_issues.extend(
+                    f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content)
+                )
 
-        if rel.endswith("schema.prisma"):
-            issues.extend(_check_prisma_regression(old_content, new_content))
-        elif rel.endswith((".ts", ".tsx", ".js")):
-            issues.extend(
-                f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content)
-            )
+        if file_issues:
+            issues.extend(file_issues)
+            try:
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w") as fh:
+                    fh.write(old_content)
+                restored.append(rel)
+            except Exception as e:  # noqa: BLE001
+                _log(f"[regression_guard] No se pudo restaurar {rel}: {e}")
 
     if issues:
-        issues_text = "\n".join(f"  - {i}" for i in issues)
+        issues_text    = "\n".join(f"  - {i}" for i in issues)
+        restored_text  = (
+            "\n\nArchivos RESTAURADOS a su contenido previo a este ciclo (la "
+            "versión con regresión NO quedó en disco): " + ", ".join(restored)
+            if restored else ""
+        )
         report = (
             "REGRESIÓN DETECTADA — el código generado eliminó elementos existentes:\n"
-            f"{issues_text}\n\n"
+            f"{issues_text}"
+            f"{restored_text}\n\n"
             "REGLA CRÍTICA: Cuando modificas un archivo existente, debes incluir TODO "
             "el contenido original (todos sus modelos, campos, funciones, exports) y "
             "solo AÑADIR los elementos nuevos. El bloque ARCHIVOS EXISTENTES del prompt "
-            "muestra el contenido que DEBE aparecer en tu output."
+            "muestra el contenido que DEBE aparecer en tu output — ese archivo fue "
+            "restaurado ahí, vuelve a intentar el cambio sobre esa base."
         )
-        _log(f"[regression_guard] ⚠ {len(issues)} regresión(es): {issues[:3]}")
+        _log(f"[regression_guard] ⚠ {len(issues)} regresión(es), {len(restored)} archivo(s) restaurado(s): {issues[:3]}")
         return {
             "regression_errors": issues,
             "validation_passed": False,
             "validation_report": report,
             "messages": [AIMessage(
-                content=f"regression_guard: ⚠ {len(issues)} regresión(es) detectadas",
+                content=f"regression_guard: ⚠ {len(issues)} regresión(es) — {len(restored)} archivo(s) restaurado(s)",
                 name="RegressionGuard"
             )],
         }
@@ -1034,6 +1553,16 @@ def regression_guard_node(state: FleetState) -> dict:
         "regression_errors": [],
         "messages": [AIMessage(content="regression_guard: ✓ sin regresiones", name="RegressionGuard")],
     }
+
+
+@task
+def _agent_generation(agent_role: str, system_instruction: str, human_instruction: str) -> str:
+    """Invocación LLM de un agent_role como task checkpointeable (Req 5.2):
+    LangGraph persiste el resultado individualmente, así una reanudación a
+    mitad de ciclo omite los agentes ya completados (Req 5.3)."""
+    response = _invoke_dev([SystemMessage(content=system_instruction),
+                            HumanMessage(content=human_instruction)])
+    return response.content
 
 
 def dynamic_developer_node(state: FleetState) -> dict:
@@ -1052,10 +1581,14 @@ def dynamic_developer_node(state: FleetState) -> dict:
             hint_dirs.append(kw)
 
     workspace_context = _get_workspace_context(workspace, hint_dirs=hint_dirs or None)
-    new_diffs   = {}
-    all_applied = list(prev_applied)  # acumular entre ciclos
+    new_diffs    = {}
+    all_applied  = list(prev_applied)  # acumular entre ciclos
+    all_rejected = []  # archivos rechazados este ciclo por la guarda anti-truncamiento
 
     cycle = state["loop_iterations"] + 1
+    # Ciclo visible para los spans de invocación LLM (Req 6.4) vía thread-local
+    # — el grafo corre síncrono en el thread del worker.
+    _thread_local.current_cycle = cycle
     _log(f"[dynamic_developer] --- Ciclo {cycle} ---")
     if feedback and feedback != "Implementacion inicial requerida.":
         _log(f"[dynamic_developer] Feedback del revisor: {feedback[:150]}")
@@ -1140,19 +1673,24 @@ def dynamic_developer_node(state: FleetState) -> dict:
         )
 
         _log(f"[dynamic_developer] Agente '{agent_role}': llamando al modelo LLM...")
-        response      = _invoke_dev([SystemMessage(content=system_instruction),
-                                     HumanMessage(content=human_instruction)])
-        response_text = response.content
+        # @task (Req 5.2/5.3): el resultado por agent_role se checkpointea
+        # individualmente — al reanudar a mitad de un ciclo con varios agentes,
+        # los roles ya completados no se re-invocan (ni se re-cobran).
+        generation = _agent_generation(agent_role, system_instruction, human_instruction)
+        # `hasattr` en vez de isinstance: con el langgraph real devuelve un
+        # future; en tests con stubs (task = identidad) devuelve el str directo.
+        response_text = generation.result() if hasattr(generation, "result") else generation
         new_diffs[agent_role] = response_text
 
         blocks = len(_re.findall(r"===FILE_BEGIN:", response_text))
         _log(f"[dynamic_developer] Respuesta recibida ({len(response_text)} chars, {blocks} bloques FILE_BEGIN detectados)")
 
         try:
-            applied = _apply_workspace_changes(workspace, response_text)
+            applied, rejected = _apply_workspace_changes(workspace, response_text, criteria=criteria)
             for f in applied:
                 if f not in all_applied:
                     all_applied.append(f)
+            all_rejected.extend(rejected)
             if applied:
                 _log(f"[dynamic_developer] Archivos escritos: {', '.join(applied[:8])}" +
                      (f" (+{len(applied)-8} más)" if len(applied) > 8 else ""))
@@ -1160,6 +1698,9 @@ def dynamic_developer_node(state: FleetState) -> dict:
             else:
                 _log(f"[dynamic_developer] AVISO: el agente '{agent_role}' no generó bloques FILE_BEGIN/END válidos")
                 logger.warning("Agente %s no genero bloques FILE_BEGIN/END", agent_role)
+            if rejected:
+                _log(f"[dynamic_developer] RECHAZADOS por guarda anti-truncamiento: {'; '.join(rejected)}")
+                logger.warning("Agente %s: archivos rechazados por truncamiento: %s", agent_role, rejected)
         except Exception as e:
             _log(f"[dynamic_developer] ERROR aplicando archivos: {e}")
             logger.error("Error aplicando cambios del agente %s: %s", agent_role, e)
@@ -1167,11 +1708,13 @@ def dynamic_developer_node(state: FleetState) -> dict:
     summary_msg = (
         f"Ciclo {cycle} completado. "
         f"Total archivos en disco: {len(all_applied)}"
+        + (f". {len(all_rejected)} rechazados por truncamiento." if all_rejected else "")
     )
     _log(f"[dynamic_developer] Ciclo {cycle} completado — {len(all_applied)} archivos totales en disco")
     return {
         "current_code_diff": new_diffs,
         "applied_files":     all_applied,
+        "rejected_files":    all_rejected,
         "loop_iterations":   cycle,
         "messages":          [AIMessage(content=summary_msg, name="DevFleet")],
     }
@@ -1229,8 +1772,11 @@ def validation_gate_node(state: FleetState) -> dict:
             )],
         }
 
+    baseline = state.get("validation_baseline_failing_tests")
+    baseline_set = set(baseline) if baseline is not None else None
+
     _log(f"[validation_gate] Validando {len(applied_files)} archivos (stack={stack})...")
-    passed, report = _validate_workspace(workspace, applied_files, stack)
+    passed, report = _validate_workspace(workspace, applied_files, stack, baseline_failing_tests=baseline_set)
     verdict = "PASÓ ✓" if passed else "FALLÓ ✗"
     _log(f"[validation_gate] {verdict}\n{report[:400]}")
     return {
@@ -1247,6 +1793,39 @@ def reviewer_node(state: FleetState) -> dict:
     applied_files  = state.get("applied_files", [])
 
     _log(f"[quality_reviewer] Revisando {len(applied_files)} archivos contra criterios de aceptación...")
+
+    # Fast-reject: un nodo previo agotó sus reintentos y el error_handler
+    # global marcó el fallo (Req 4.3) — no gastar el LLM revisor; el router
+    # desviará al cierre ordenado.
+    if state.get("aborted"):
+        _log("[quality_reviewer] RECHAZO RÁPIDO: ciclo abortado por fallo de nodo (error_handler)")
+        return {
+            "reviewer_feedback": state.get("reviewer_feedback", "Ciclo abortado por fallo de un nodo."),
+            "is_approved": False,
+        }
+
+    # Fast-reject: la guarda anti-truncamiento de _apply_workspace_changes marcó
+    # algún archivo como rechazado (reescritura masiva de un archivo existente
+    # grande). Nunca dejar que el LLM reviewer "apruebe" un ciclo así — el
+    # riesgo es justamente que el reviewer no note la pérdida de datos (ver
+    # requerimiento 06).
+    rejected_files = state.get("rejected_files", [])
+    if rejected_files:
+        _log(f"[quality_reviewer] RECHAZO RÁPIDO: guarda anti-truncamiento detectó {len(rejected_files)} archivo(s)")
+        logger.warning("Reviewer fast-reject: archivos rechazados por truncamiento: %s", rejected_files)
+        return {
+            "reviewer_feedback": (
+                "Uno o más archivos fueron rechazados porque el contenido generado "
+                "perdió más del 30% de sus líneas/bytes respecto al original "
+                "(posible truncamiento o reescritura no solicitada):\n\n"
+                + "\n".join(rejected_files)
+                + "\n\nPara archivos grandes NO regeneres el archivo completo: usa un "
+                "enfoque de edición dirigida (describe los cambios línea por línea) o, "
+                "si el archivo es demasiado grande para reproducirlo íntegro, divide el "
+                "trabajo en ediciones más pequeñas."
+            ),
+            "is_approved": False,
+        }
 
     # Fast-reject: si el desarrollador no escribió ningún archivo, no llamar al LLM
     if not applied_files:
@@ -1324,7 +1903,9 @@ def git_finalize_node(state: FleetState) -> dict:
     applied   = state.get("applied_files", [])
 
     if not branch or not _is_git_repo(workspace):
-        _log("[git_finalize] Sin rama de trabajo (modo sin-git); se omite commit/PR")
+        # No debería ocurrir: git_setup aborta el grafo entero si no hay repo git
+        # o el árbol estaba sucio. Guardia defensiva por si el estado llega roto.
+        _log("[git_finalize] Sin rama de trabajo; se omite commit/PR")
         return {"pr_url": "", "messages": [AIMessage(content="git omitido", name="GitOps")]}
 
     if not applied:
@@ -1620,8 +2201,21 @@ def stop_gracefully(ticket_id: str, current_phase: str, iterations: int, applied
 # ===========================================================================
 def quality_gate_router(state: FleetState) -> str:
     """Avanza a finalizar SOLO si validación determinista pasó Y el revisor aprobó.
-    Si no, reitera el ciclo dev→validación→review hasta agotar 6 ciclos."""
+    Si no, reitera el ciclo dev→validación→review hasta agotar 6 ciclos.
+
+    Cortes adicionales hacia el cierre ordenado (git_finalize → jira_updater):
+    - `aborted`: un nodo agotó sus reintentos y el error_handler global marcó
+      el fallo — no tiene sentido seguir iterando (Req 4.3).
+    - `remaining_steps < 8`: no queda presupuesto de super-steps para otro
+      ciclo completo (~4 pasos) más el camino de cierre (~3 pasos); cerrar
+      ordenadamente en vez de morir con GraphRecursionError (Req 7.4).
+    """
     approved = state.get("is_approved", False) and state.get("validation_passed", False)
+    if state.get("aborted"):
+        return "git_finalize"
+    if state.get("remaining_steps", 999) < 8:
+        _log(f"[quality_gate] remaining_steps={state.get('remaining_steps')} — cierre ordenado por límite de recursión")
+        return "git_finalize"
     if state["loop_iterations"] >= 6 or approved:
         return "git_finalize"
     return "dynamic_developer"
@@ -1630,23 +2224,67 @@ def quality_gate_router(state: FleetState) -> str:
 # ===========================================================================
 # 8. Construccion del grafo
 # ===========================================================================
+def _node_error_handler(state, error) -> dict:
+    """Recuperación tras agotar los reintentos de un nodo (Req 4.3): en vez de
+    una excepción que mata el worker con estado a medias, marca el fallo en el
+    estado y deja que quality_gate_router desvíe al cierre ordenado — el
+    trabajo parcial queda commiteado en su rama para inspección."""
+    node = getattr(error, "node", "?")
+    err = getattr(error, "error", error)
+    msg = f"ABORTADO: el nodo {node} falló tras agotar reintentos: {str(err)[:400]}"
+    _log(f"[error_handler] {msg}")
+    return {
+        "aborted":           True,
+        "is_approved":       False,
+        "validation_passed": False,
+        "reviewer_feedback": msg,
+        "messages":          [AIMessage(content=msg, name="ErrorHandler")],
+    }
+
+
+def _traced_node(fn: Callable, name: str) -> Callable:
+    """Envuelve un nodo con un span OTel (Req 6.3). Si el tracing está
+    deshabilitado, node_span es un no-op sin overhead observable."""
+    def wrapper(state):
+        with fleet_tracing.node_span(name):
+            return fn(state)
+    wrapper.__name__ = getattr(fn, "__name__", name)
+    return wrapper
+
+
 def build_architecture() -> StateGraph:
     graph = StateGraph(FleetState)
-    graph.add_node("context_ingestion",  fetch_and_plan_node)
-    graph.add_node("git_setup",          git_setup_node)
-    graph.add_node("planner",            planner_node)
-    graph.add_node("codebase_reader",    codebase_reader_node)    # lee archivos antes de modificar
-    graph.add_node("dynamic_developer",  dynamic_developer_node)
-    graph.add_node("regression_guard",   regression_guard_node)   # detecta regresiones post-generación
-    graph.add_node("validation_gate",    validation_gate_node)
-    graph.add_node("quality_reviewer",   reviewer_node)
-    graph.add_node("git_finalize",       git_finalize_node)
-    graph.add_node("staging_tester",     staging_tester_node)      # smoke tests + E2E contra staging
-    graph.add_node("jira_updater",       finalize_and_update_jira)
+    # Tolerancia a fallos global (Req 4.1, 4.2): 2 intentos por nodo (el
+    # retry_on default ya excluye ValueError/TypeError — bugs de programación,
+    # Req 4.5/4.6) y handler de recuperación al agotarlos.
+    graph.set_node_defaults(
+        retry_policy=RetryPolicy(max_attempts=2),
+        error_handler=_node_error_handler,
+    )
+    graph.add_node("context_ingestion",  _traced_node(fetch_and_plan_node, "context_ingestion"))
+    graph.add_node("git_setup",          _traced_node(git_setup_node, "git_setup"))
+    graph.add_node("planner",            _traced_node(planner_node, "planner"))
+    graph.add_node("codebase_reader",    _traced_node(codebase_reader_node, "codebase_reader"))    # lee archivos antes de modificar
+    # dynamic_developer con 1 solo intento (Req 4.4): sus llamadas LLM ya
+    # tienen reintentos multicapa en _invoke_chain (backoff de gateway +
+    # cadena de fallback de modelos); un retry a nivel nodo duplicaría todo
+    # ese trabajo y el costo de tokens.
+    graph.add_node("dynamic_developer",  _traced_node(dynamic_developer_node, "dynamic_developer"),
+                   retry_policy=RetryPolicy(max_attempts=1))
+    graph.add_node("regression_guard",   _traced_node(regression_guard_node, "regression_guard"))   # detecta regresiones post-generación
+    graph.add_node("validation_gate",    _traced_node(validation_gate_node, "validation_gate"))
+    graph.add_node("quality_reviewer",   _traced_node(reviewer_node, "quality_reviewer"))
+    graph.add_node("git_finalize",       _traced_node(git_finalize_node, "git_finalize"))
+    graph.add_node("staging_tester",     _traced_node(staging_tester_node, "staging_tester"))      # smoke tests + E2E contra staging
+    graph.add_node("jira_updater",       _traced_node(finalize_and_update_jira, "jira_updater"))
 
     graph.add_edge(START, "context_ingestion")
     graph.add_edge("context_ingestion", "git_setup")
-    graph.add_edge("git_setup",         "planner")
+    graph.add_conditional_edges(
+        "git_setup",
+        lambda state: "aborted" if state.get("aborted") else "continue",
+        {"aborted": END, "continue": "planner"},
+    )
     graph.add_edge("planner",           "codebase_reader")         # captura archivos existentes
     graph.add_edge("codebase_reader",   "dynamic_developer")
     graph.add_edge("dynamic_developer", "regression_guard")        # verifica regresiones antes de tsc
@@ -1660,7 +2298,10 @@ def build_architecture() -> StateGraph:
     graph.add_edge("git_finalize",   "staging_tester")             # deploy + smoke + E2E en staging
     graph.add_edge("staging_tester", "jira_updater")
     graph.add_edge("jira_updater",   END)
-    return graph.compile()
+    # Checkpointer durable (Req 1.1): el estado se persiste tras cada
+    # super-step; con thread_id=job_id un job interrumpido se reanuda desde
+    # el último checkpoint en vez de redespachar desde cero.
+    return graph.compile(checkpointer=_get_checkpointer())
 
 
 # ===========================================================================
@@ -1706,8 +2347,12 @@ if __name__ == "__main__":
     }
 
     print(f"\nIniciando flota para: {args.ticket or args.requirement[:60]}")
-    for step_event in engine.stream(initial_payload, stream_mode="updates"):
+    cli_job_id = f"cli-{os.urandom(6).hex()}"
+    for step_event in engine.stream(initial_payload, invoke_config(cli_job_id), stream_mode="updates"):
         for node_name, data in step_event.items():
+            # Los @task también emiten eventos con valor crudo (no dict) — saltarlos.
+            if not isinstance(data, dict):
+                continue
             if data.get("messages"):
                 print(f"\n[{node_name}] -> {data['messages'][-1].content}")
 

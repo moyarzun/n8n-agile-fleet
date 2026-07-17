@@ -43,6 +43,12 @@ services:
       - JIRA_USER=${JIRA_USER}
       - JIRA_API_TOKEN=${JIRA_API_TOKEN}
       - FLEET_DB=/data/n8n_store/fleet.db
+      # Checkpoints durables de LangGraph (spec langgraph-hardening, Req 1)
+      - FLEET_CHECKPOINT_DB=/data/n8n_store/checkpoints.db
+      # Reanudación automática de jobs interrumpidos al arrancar (Req 2)
+      - FLEET_AUTO_RESUME=${FLEET_AUTO_RESUME:-false}
+      # Trazas OTel → Jaeger; vacío = tracing deshabilitado (Req 6)
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       # Comando de validación determinista del proyecto (corre la suite real).
       - FLEET_VALIDATE_CMD=${FLEET_VALIDATE_CMD:-}
       - FLEET_VALIDATE_TIMEOUT=${FLEET_VALIDATE_TIMEOUT:-600}
@@ -64,6 +70,16 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Backend + UI de trazas OTel (spec langgraph-hardening, Req 6.5)
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: fleet-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # UI
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
 
   mcp-fleet-server:
     build: .

@@ -1,6 +1,13 @@
-langgraph>=0.0.26
-langchain-openai>=0.0.8
-langchain-core>=0.1.0
+langgraph>=1.2,<2.0
+langchain-openai>=1.0,<2.0
+langchain-core>=1.0,<2.0
+# langgraph-checkpoint-sqlite se instala aparte en el Dockerfile con --no-deps:
+# su dependencia sqlite-vec no tiene distribución para Alpine/musl aarch64, y
+# SqliteSaver (lo único que usamos) no la necesita — es import lazy solo para
+# las features de vector store.
+opentelemetry-api>=1.25,<2
+opentelemetry-sdk>=1.25,<2
+opentelemetry-exporter-otlp-proto-http>=1.25,<2
 atlassian-python-api>=3.14.0
 pydantic>=2.0.0
 fastapi>=0.110.0

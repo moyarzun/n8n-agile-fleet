@@ -12,11 +12,50 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
-from langgraph_fleet import build_architecture, FleetState, stop_gracefully, set_log_callback
+from langgraph_fleet import (
+    build_architecture, FleetState, stop_gracefully, set_log_callback,
+    invoke_config, delete_job_checkpoints, GraphRecursionError,
+)
+import fleet_tracing
 
 app = FastAPI(title="LangGraph Fleet API")
 _async_executor = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_ASYNC_WORKERS", "8")))
 _wait_executor  = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_WAIT_WORKERS", "4")))
+
+
+def _check_spec_kiro_gate(workspace: str) -> Optional[str]:
+    """Gate de spec-kiro (ver ~/.claude/skills/spec-kiro/SKILL.md): si el
+    proyecto en `workspace` tiene specs bajo .claude/specs/, la Flota solo
+    puede ejecutar cuando TODAS estén aprobadas (phase="tasks", approved=true).
+
+    Devuelve None si no hay nada que bloquee (incluye el caso de proyectos que
+    no usan spec-kiro: no existe .claude/specs/ → no aplica el gate). Devuelve
+    un string con el motivo si hay que bloquear.
+    """
+    specs_dir = os.path.join(workspace, ".claude", "specs")
+    if not os.path.isdir(specs_dir):
+        return None
+
+    pending = []
+    for entry in sorted(os.listdir(specs_dir)):
+        state_file = os.path.join(specs_dir, entry, "state.json")
+        if not os.path.isfile(state_file):
+            continue
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                spec_state = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if spec_state.get("phase") != "tasks" or spec_state.get("approved") is not True:
+            pending.append(f"{entry} (fase: {spec_state.get('phase', '?')})")
+
+    if not pending:
+        return None
+    return (
+        "Hay specs de spec-kiro sin aprobar en este proyecto: " + ", ".join(pending)
+        + ". La Flota no puede ejecutar hasta que el usuario apruebe la fase de "
+        "tasks para todas las specs en progreso (.claude/specs/<feature>/state.json)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +86,7 @@ class FleetResponse(BaseModel):
 class JobState:
     job_id: str
     ticket_id: str
+    workspace: str = ""
     status: str = "queued"
     phase: str = ""
     iteration: int = 0
@@ -60,6 +100,7 @@ class JobState:
         return {
             "job_id": self.job_id,
             "ticket_id": self.ticket_id,
+            "workspace": self.workspace,
             "status": self.status,
             "phase": self.phase,
             "iteration": self.iteration,
@@ -92,6 +133,7 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id      TEXT PRIMARY KEY,
                 ticket_id   TEXT NOT NULL,
+                workspace   TEXT DEFAULT '',
                 status      TEXT NOT NULL,
                 phase       TEXT DEFAULT '',
                 iteration   INTEGER DEFAULT 0,
@@ -102,6 +144,10 @@ def _init_db() -> None:
                 logs        TEXT DEFAULT '[]'
             )
         """)
+        # Migración in-place para bases de datos creadas antes de este campo.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "workspace" not in existing_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN workspace TEXT DEFAULT ''")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS token_metrics (
                 model            TEXT PRIMARY KEY,
@@ -133,11 +179,11 @@ def _persist_job(job: "JobState") -> None:
         conn = _db_conn()
         conn.execute("""
             INSERT OR REPLACE INTO jobs
-              (job_id, ticket_id, status, phase, iteration, files_count,
+              (job_id, ticket_id, workspace, status, phase, iteration, files_count,
                summary, started_at, finished_at, logs)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            job.job_id, job.ticket_id, job.status, job.phase,
+            job.job_id, job.ticket_id, job.workspace, job.status, job.phase,
             job.iteration, job.files_count, job.summary,
             job.started_at, job.finished_at,
             json.dumps(job.logs[-500:]),
@@ -266,6 +312,7 @@ def _load_jobs_from_db() -> Dict[str, "JobState"]:
         interrupted = []
         for row in rows:
             j = JobState(job_id=row["job_id"], ticket_id=row["ticket_id"])
+            j.workspace   = row["workspace"] if "workspace" in row.keys() else ""
             j.status      = row["status"]
             j.phase       = row["phase"] or ""
             j.iteration   = row["iteration"] or 0
@@ -274,11 +321,13 @@ def _load_jobs_from_db() -> Dict[str, "JobState"]:
             j.started_at  = row["started_at"]
             j.finished_at = row["finished_at"]
             j.logs        = json.loads(row["logs"] or "[]")
-            # Jobs activos sin worker real → marcar como interrumpidos
+            # Jobs activos sin worker real → marcar como interrumpidos.
+            # Sin finished_at: el job queda reanudable desde su checkpoint
+            # (spec langgraph-hardening, Req 2.1).
             if j.status in ("queued", "running"):
                 j.status = "interrupted"
-                j.finished_at = datetime.now(timezone.utc).isoformat()
-                j.summary = "Interrumpido por reinicio del contenedor."
+                j.finished_at = None
+                j.summary = "Interrumpido por reinicio — reanudable."
                 interrupted.append(j)
             jobs[j.job_id] = j
         if interrupted:
@@ -333,13 +382,39 @@ def _emit(event_name: str, data: dict) -> None:
 # Startup / shutdown
 # ---------------------------------------------------------------------------
 
+def _auto_resume_interrupted() -> int:
+    """Si FLEET_AUTO_RESUME es 'true', reanuda cada job interrumpido desde su
+    checkpoint (Req 2.2); si no, los deja en 'interrupted' para reanudación
+    manual vía POST /resume/{job_id} (Req 2.3). Devuelve cuántos despachó."""
+    if os.getenv("FLEET_AUTO_RESUME", "").strip().lower() != "true":
+        return 0
+    resumed = 0
+    for job in list(_jobs.values()):
+        if job.status != "interrupted":
+            continue
+        job.status = "running"
+        job.summary = ""
+        stop_flag = threading.Event()
+        _stop_flags[job.job_id] = stop_flag
+        _async_executor.submit(
+            _run_fleet_worker, job.job_id, job.ticket_id, job.workspace,
+            stop_flag, resume=True,
+        )
+        resumed += 1
+    if resumed:
+        print(f"[fleet] FLEET_AUTO_RESUME: {resumed} job(s) reanudado(s) desde checkpoint.")
+    return resumed
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _main_loop, _jobs
     _main_loop = asyncio.get_running_loop()
+    fleet_tracing.setup_tracing()
     _init_db()
     _jobs = _load_jobs_from_db()
     print(f"[fleet] DB cargada: {len(_jobs)} jobs restaurados desde {_DB_PATH}")
+    _auto_resume_interrupted()
     asyncio.create_task(_broadcast_loop())
     asyncio.create_task(_cleanup_loop())
 
@@ -362,11 +437,16 @@ async def _cleanup_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: threading.Event,
-                      requirement: str = "", agents: Optional[List[str]] = None) -> dict:
+                      requirement: str = "", agents: Optional[List[str]] = None,
+                      resume: bool = False) -> dict:
     """Ejecuta engine.stream() sincrónicamente. Actualiza _jobs y emite eventos SSE.
 
     Dos modos: ticket de Jira (ticket_id real) o requerimiento libre (requirement),
     este último para cualquier proyecto sin Jira.
+
+    Con resume=True retoma un job interrumpido desde su último checkpoint
+    (input None + mismo thread_id — el patrón de "straight resume" de
+    LangGraph; spec langgraph-hardening, Req 2.2/2.4).
     """
     job = _jobs[job_id]
     job.status = "running"
@@ -441,8 +521,32 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
         }
         final_state: dict = dict(initial)
 
-        for step_event in engine.stream(initial, stream_mode="updates"):
+        # resume=True → input None: LangGraph carga el último checkpoint del
+        # thread_id y continúa desde el nodo siguiente (Req 2.2/2.4).
+        stream_input = None if resume else initial
+        if resume:
+            # Sembrar final_state desde el checkpoint: si solo quedan los nodos
+            # de cierre, campos como is_approved no aparecerían en los updates
+            # restantes y el veredicto final saldría mal.
+            try:
+                snapshot = engine.get_state(invoke_config(job_id))
+                if snapshot is not None and getattr(snapshot, "values", None):
+                    final_state.update(snapshot.values)
+            except Exception:
+                pass
+
+        # Span raíz del job (Req 6.3). Enter/exit explícito para no reindentar
+        # todo el loop; se cierra en el finally.
+        _job_span_cm = fleet_tracing.job_span(job_id, ticket_id)
+        _job_span_cm.__enter__()
+
+        for step_event in engine.stream(stream_input, invoke_config(job_id), stream_mode="updates"):
             for node_name, data in step_event.items():
+                # Los @task dentro de nodos (p.ej. _agent_generation) también
+                # emiten eventos en stream_mode="updates", con su valor de
+                # retorno crudo (str) en vez de un dict de estado — saltarlos.
+                if not isinstance(data, dict):
+                    continue
                 if data.get("loop_iterations") is not None:
                     job.iteration = data["loop_iterations"]
                 if data.get("applied_files"):
@@ -488,14 +592,27 @@ def _run_fleet_worker(job_id: str, ticket_id: str, workspace: str, stop_flag: th
             job.status = "approved" if final_state.get("is_approved") else "rejected"
             job.summary = final_state.get("reviewer_feedback", "")
 
+    except GraphRecursionError:
+        # Req 7.2: el grafo excedió el recursion_limit — cierre con motivo claro.
+        job.status = "error"
+        job.summary = ("Límite de recursión (60 super-steps) alcanzado — ejecución "
+                       "cortada para evitar un loop descontrolado. Revisa el ruteo del grafo.")
     except Exception as exc:
         job.status = "error"
         job.summary = str(exc)
 
     finally:
         _stop_flags.pop(job_id, None)
+        try:
+            _job_span_cm.__exit__(None, None, None)
+        except Exception:  # incluye NameError si el span nunca llegó a abrirse
+            pass
 
     job.finished_at = datetime.now(timezone.utc).isoformat()
+    # Req 1.3: al alcanzar estado final, los checkpoints del thread ya no se
+    # necesitan (el historial queda en la tabla jobs + trazas OTel).
+    if job.status in ("approved", "rejected", "error", "stopped"):
+        delete_job_checkpoints(job_id)
     _persist_job(job)
     elapsed = int(
         (datetime.now(timezone.utc) - datetime.fromisoformat(job.started_at))
@@ -528,6 +645,10 @@ def health() -> dict:
 
 @app.post("/run")
 async def run_fleet(req: TicketRequest, request: Request):
+    gate_error = _check_spec_kiro_gate(req.workspace)
+    if gate_error:
+        raise HTTPException(status_code=422, detail=gate_error)
+
     # Deduplicación: rechazar si el ticket ya tiene un job activo
     active = next(
         (job for job in _jobs.values()
@@ -542,7 +663,7 @@ async def run_fleet(req: TicketRequest, request: Request):
 
     wait = request.headers.get("X-Wait", "").lower() in ("true", "1")
     job_id = str(uuid.uuid4())
-    job = JobState(job_id=job_id, ticket_id=req.ticket_id)
+    job = JobState(job_id=job_id, ticket_id=req.ticket_id, workspace=req.workspace)
     _jobs[job_id] = job
     _persist_job(job)
     stop_flag = threading.Event()
@@ -580,10 +701,14 @@ async def solve_task(req: TaskRequest, request: Request):
     if not req.requirement.strip():
         raise HTTPException(status_code=422, detail="'requirement' no puede estar vacío")
 
+    gate_error = _check_spec_kiro_gate(req.workspace)
+    if gate_error:
+        raise HTTPException(status_code=422, detail=gate_error)
+
     task_id = "TASK-" + uuid.uuid4().hex[:8]
     wait    = request.headers.get("X-Wait", "").lower() in ("true", "1")
     job_id  = str(uuid.uuid4())
-    job = JobState(job_id=job_id, ticket_id=task_id)
+    job = JobState(job_id=job_id, ticket_id=task_id, workspace=req.workspace)
     _jobs[job_id] = job
     _persist_job(job)
     stop_flag = threading.Event()
@@ -623,6 +748,36 @@ async def stop_job(job_id: str):
     if flag:
         flag.set()
     return {"job_id": job_id, "stopping": True}
+
+
+@app.post("/resume/{job_id}")
+async def resume_job(job_id: str):
+    """Reanuda un job interrumpido desde su último checkpoint (spec
+    langgraph-hardening, Req 2.4-2.6)."""
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} no encontrado")
+    if job.status != "interrupted":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} no es reanudable (status={job.status}; se requiere 'interrupted')",
+        )
+    job.status = "running"
+    job.summary = ""
+    _persist_job(job)
+    stop_flag = threading.Event()
+    _stop_flags[job_id] = stop_flag
+    loop = asyncio.get_running_loop()
+
+    async def _fire_and_forget() -> None:
+        await loop.run_in_executor(
+            _async_executor, lambda: _run_fleet_worker(
+                job_id, job.ticket_id, job.workspace, stop_flag, resume=True,
+            )
+        )
+
+    asyncio.create_task(_fire_and_forget())
+    return {"job_id": job_id, "resuming": True}
 
 
 @app.get("/metrics")
