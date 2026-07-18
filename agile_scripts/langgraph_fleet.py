@@ -563,7 +563,9 @@ def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
 
 # Extensión de ruta de archivo de código/config que reconocemos al parsear
 # rutas dentro del texto del requerimiento (mismo set que codebase_reader).
-_FILE_PATH_RE = r"[\w/\-\.]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|yaml|yml|md|sh|css|scss|html|vue)"
+# Los corchetes `[]` permiten capturar rutas dinámicas de Next.js
+# (`[param]`) — ver requerimiento 16.
+_FILE_PATH_RE = r"[\w/\-\.\[\]]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|yaml|yml|md|sh|css|scss|html|vue)"
 
 # Requerimiento 15: frases de prohibición explícita por nombre de archivo. El
 # req 11 solo cubría el caso "companion no mencionado"; acá se cubre el caso
@@ -1282,14 +1284,41 @@ def _check_prisma_regression(old: str, new: str) -> List[str]:
 
 
 def _check_ts_exports_regression(old: str, new: str) -> List[str]:
-    """Detecta exports de TypeScript/JS eliminados en la versión generada."""
+    """Detecta exports de TypeScript/JS eliminados en la versión generada.
+
+    Cubre `export [async] function/class/const/type/interface/enum NOMBRE` — lo
+    que incluye los handlers HTTP de Next.js (`export async function GET/POST/
+    PUT/DELETE/PATCH`) en archivos route.ts. Ver requerimiento 16: un ciclo
+    reescribió un route.ts bajo ALLOW_REWRITE y perdió el handler GET; esta
+    comparación lo marca como regresión — ALLOW_REWRITE autoriza reescribir el
+    contenido, NO perder capacidades públicas del archivo."""
     pat = r'^export\s+(?:async\s+)?(?:function|class|const|type|interface|enum)\s+(\w+)'
     old_exports = set(_re.findall(pat, old, _re.MULTILINE))
     new_exports = set(_re.findall(pat, new, _re.MULTILINE))
     removed = old_exports - new_exports
     if removed:
-        return [f"exports eliminados: {sorted(removed)}"]
+        _HTTP_HANDLERS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+        http_lost = sorted(removed & _HTTP_HANDLERS)
+        detail = f"exports eliminados: {sorted(removed)}"
+        if http_lost:
+            detail += f" — incluye handler(s) HTTP: {http_lost} (endpoint(s) perdido(s))"
+        return [detail]
     return []
+
+
+def _git_original_content(workspace: str, rel_path: str) -> Optional[str]:
+    """Contenido de un archivo tal como está commiteado en HEAD del worktree.
+
+    La Flota solo commitea en git_finalize (al final), así que durante todos
+    los ciclos HEAD == la base del ticket: `git show HEAD:<path>` devuelve el
+    'antes' real de CUALQUIER archivo modificado. Requerimiento 16: esto cubre
+    los archivos que codebase_reader NO alcanzó a leer — rutas dinámicas de
+    Next.js con corchetes (`[param]`, que la regex de paths no capturaba) y
+    archivos no mencionados en el requerimiento — para que regression_guard
+    tenga siempre una base contra qué comparar. Devuelve None si el archivo no
+    existía en HEAD (archivo nuevo del ticket) o si git no está disponible."""
+    rc, out = _git(["show", f"HEAD:{rel_path}"], workspace)
+    return out if rc == 0 else None
 
 
 # ===========================================================================
@@ -1584,8 +1613,13 @@ def codebase_reader_node(state: FleetState) -> dict:
     # filesystem), y el modelo termina alucinando una versión propia del
     # contenido a partir del nombre/descripción (ver requerimiento 08).
     text = "\n".join(subtasks) + "\n" + criteria
+    # Los corchetes `[]` en la clase permiten capturar rutas dinámicas de
+    # Next.js (ej. `src/app/api/messages/[conversationId]/route.ts`) —
+    # requerimiento 16: sin ellos, esos archivos nunca se leían como contexto
+    # ni se comparaban en regression_guard, y una pérdida de handler pasaba
+    # inadvertida.
     found = _re.findall(
-        r'[\w/\-\.]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml|md)',
+        r'[\w/\-\.\[\]]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml|md)',
         text
     )
     candidates = list(dict.fromkeys(
@@ -1633,8 +1667,22 @@ def regression_guard_node(state: FleetState) -> dict:
     para archivos más grandes que eso, la restauración también sería parcial.
     """
     workspace      = state["workspace_path"]
-    existing_files = state.get("existing_files", {})
+    existing_files = dict(state.get("existing_files", {}))
     applied_files  = set(state.get("applied_files", []))
+
+    # Requerimiento 16: augmentar existing_files con el 'antes' desde git para
+    # cualquier archivo aplicado que codebase_reader no capturó (rutas
+    # dinámicas con corchetes, archivos no mencionados). Sin esto, regression_
+    # guard no tiene base contra qué comparar y una pérdida de export público
+    # (ej. el handler GET de un route.ts dinámico) pasa inadvertida.
+    for rel in applied_files:
+        if rel in existing_files:
+            continue
+        if not rel.endswith((".ts", ".tsx", ".js")) and not rel.endswith("schema.prisma"):
+            continue  # solo tipos que sabemos comparar
+        original = _git_original_content(workspace, rel)
+        if original is not None:
+            existing_files[rel] = original
 
     issues: List[str] = []
     restored: List[str] = []
@@ -1694,6 +1742,10 @@ def regression_guard_node(state: FleetState) -> dict:
             "regression_errors": issues,
             "validation_passed": False,
             "validation_report": report,
+            # existing_files augmentado (con originales recuperados de git): el
+            # próximo ciclo del dynamic_developer lo verá en el bloque ARCHIVOS
+            # EXISTENTES y podrá re-portar el export perdido sobre esa base.
+            "existing_files": existing_files,
             "messages": [AIMessage(
                 content=f"regression_guard: ⚠ {len(issues)} regresión(es) — {len(restored)} archivo(s) restaurado(s)",
                 name="RegressionGuard"
@@ -1703,6 +1755,7 @@ def regression_guard_node(state: FleetState) -> dict:
     _log(f"[regression_guard] ✓ sin regresiones ({len(existing_files)} archivos verificados)")
     return {
         "regression_errors": [],
+        "existing_files": existing_files,
         "messages": [AIMessage(content="regression_guard: ✓ sin regresiones", name="RegressionGuard")],
     }
 
