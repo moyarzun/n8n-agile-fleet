@@ -33,7 +33,7 @@ def test_job_state_to_dict():
     d = job.to_dict()
 
     assert set(d.keys()) == {
-        "job_id", "ticket_id", "status", "phase",
+        "job_id", "ticket_id", "workspace", "status", "phase",
         "iteration", "files_count", "logs",
         "started_at", "finished_at", "summary",
     }
@@ -42,7 +42,7 @@ def test_job_state_to_dict():
 
 def test_run_fleet_worker_updates_job_state(monkeypatch):
     """Worker actualiza status y emite eventos correctamente."""
-    import sys, os
+    import sys, os, threading
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
     import fleet_api
 
@@ -56,17 +56,17 @@ def test_run_fleet_worker_updates_job_state(monkeypatch):
     class FakeMsg:
         content = "Test message"
 
-    def fake_stream(initial, stream_mode):
+    def fake_stream(initial, config, stream_mode):
         yield {"dynamic_developer": {"messages": [FakeMsg()], "loop_iterations": 1, "applied_files": ["a.py", "b.py"]}}
         yield {"quality_reviewer": {"messages": [FakeMsg()], "is_approved": True, "reviewer_feedback": "OK"}}
 
     class FakeEngine:
-        def stream(self, initial, stream_mode):
-            return fake_stream(initial, stream_mode)
+        def stream(self, initial, config=None, stream_mode=None):
+            return fake_stream(initial, config, stream_mode)
 
     monkeypatch.setattr(fleet_api, "build_architecture", lambda: FakeEngine())
 
-    result = fleet_api._run_fleet_worker("test-1", "SCRUM-99", "/workspace")
+    result = fleet_api._run_fleet_worker("test-1", "SCRUM-99", "/workspace", threading.Event())
 
     assert job.status == "approved"
     assert job.iteration == 1
@@ -102,7 +102,7 @@ def test_run_returns_job_id(monkeypatch):
     # Mock _run_fleet_worker para no ejecutar el fleet real
     monkeypatch.setattr(
         fleet_api, "_run_fleet_worker",
-        lambda job_id, ticket_id, workspace: {"approved": True, "iterations": 1, "summary": "ok"}
+        lambda job_id, ticket_id, workspace, stop_flag: {"approved": True, "iterations": 1, "summary": "ok"}
     )
 
     client = TestClient(app)
@@ -144,7 +144,7 @@ def test_run_x_wait_returns_fleet_response(monkeypatch):
 
     monkeypatch.setattr(
         fleet_api, "_run_fleet_worker",
-        lambda job_id, ticket_id, workspace: {"approved": True, "iterations": 2, "summary": "Listo"}
+        lambda job_id, ticket_id, workspace, stop_flag: {"approved": True, "iterations": 2, "summary": "Listo"}
     )
 
     client = TestClient(app)
@@ -198,3 +198,165 @@ def test_dashboard_returns_html():
     assert "EventSource" in r.text
     assert "/events" in r.text
     assert "/status" in r.text
+
+
+# ---------------------------------------------------------------------------
+# Spec langgraph-hardening — Req 2 (reanudación) y Req 7.2 (GraphRecursionError)
+# ---------------------------------------------------------------------------
+
+def _make_interrupted_job(fleet_api, job_id="int-1", ticket_id="SCRUM-77"):
+    job = fleet_api.JobState(job_id=job_id, ticket_id=ticket_id, workspace="/workspace")
+    job.status = "interrupted"
+    job.finished_at = None
+    fleet_api._jobs[job_id] = job
+    return job
+
+
+def test_resume_endpoint_404_si_job_no_existe():
+    from starlette.testclient import TestClient
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    from fleet_api import app
+    client = TestClient(app)
+    r = client.post("/resume/no-existe")
+    assert r.status_code == 404
+
+
+def test_resume_endpoint_409_si_status_no_es_interrupted():
+    from starlette.testclient import TestClient
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+    from fleet_api import app
+
+    job = fleet_api.JobState(job_id="done-1", ticket_id="SCRUM-1", workspace="/workspace")
+    job.status = "approved"
+    fleet_api._jobs["done-1"] = job
+
+    client = TestClient(app)
+    r = client.post("/resume/done-1")
+    assert r.status_code == 409
+
+
+def test_resume_endpoint_reanuda_job_interrumpido(monkeypatch):
+    from starlette.testclient import TestClient
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+    from fleet_api import app
+
+    _make_interrupted_job(fleet_api, job_id="int-2")
+
+    calls = []
+    monkeypatch.setattr(
+        fleet_api, "_run_fleet_worker",
+        lambda job_id, ticket_id, workspace, stop_flag, requirement="", agents=None, resume=False:
+            calls.append({"job_id": job_id, "resume": resume}) or {"approved": True},
+    )
+
+    client = TestClient(app)
+    r = client.post("/resume/int-2")
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "int-2", "resuming": True}
+    assert fleet_api._jobs["int-2"].status == "running"
+
+
+def test_auto_resume_respeta_env_var(monkeypatch):
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+
+    calls = []
+    monkeypatch.setattr(
+        fleet_api, "_run_fleet_worker",
+        lambda *a, **kw: calls.append(kw) or {"approved": True},
+    )
+
+    # Sin FLEET_AUTO_RESUME: no reanuda nada (Req 2.3)
+    monkeypatch.delenv("FLEET_AUTO_RESUME", raising=False)
+    _make_interrupted_job(fleet_api, job_id="int-3")
+    assert fleet_api._auto_resume_interrupted() == 0
+    assert fleet_api._jobs["int-3"].status == "interrupted"
+
+    # Con FLEET_AUTO_RESUME=true: despacha worker con resume=True (Req 2.2)
+    monkeypatch.setenv("FLEET_AUTO_RESUME", "true")
+    assert fleet_api._auto_resume_interrupted() == 1
+    assert fleet_api._jobs["int-3"].status == "running"
+
+
+def test_graph_recursion_error_marca_job_error_con_summary_claro(monkeypatch):
+    """Req 7.2: GraphRecursionError → status 'error' + summary que menciona el límite."""
+    import sys, os, threading
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+
+    job = fleet_api.JobState(job_id="rec-1", ticket_id="SCRUM-9", workspace="/workspace")
+    fleet_api._jobs["rec-1"] = job
+    monkeypatch.setattr(fleet_api, "_emit", lambda name, data: None)
+
+    class RecursionEngine:
+        def stream(self, initial, config=None, stream_mode=None):
+            raise fleet_api.GraphRecursionError("limit hit")
+
+    monkeypatch.setattr(fleet_api, "build_architecture", lambda: RecursionEngine())
+
+    fleet_api._run_fleet_worker("rec-1", "SCRUM-9", "/workspace", threading.Event())
+
+    assert job.status == "error"
+    assert "recursión" in job.summary.lower()
+
+
+def test_worker_tolera_eventos_de_task_con_valor_no_dict(monkeypatch):
+    """Regresión (bug encontrado en la prueba de humo de la spec): los @task
+    dentro de nodos emiten eventos en stream_mode='updates' con su valor de
+    retorno crudo (str) — el worker no debe crashear con
+    "'str' object has no attribute 'get'"."""
+    import sys, os, threading
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+
+    job = fleet_api.JobState(job_id="task-ev-1", ticket_id="SCRUM-3", workspace="/workspace")
+    fleet_api._jobs["task-ev-1"] = job
+    monkeypatch.setattr(fleet_api, "_emit", lambda name, data: None)
+
+    class FakeMsg:
+        content = "ok"
+
+    class TaskEventEngine:
+        def stream(self, initial, config=None, stream_mode=None):
+            yield {"_agent_generation": "===FILE_BEGIN: a.py===\ncodigo\n===FILE_END==="}  # evento de task (str)
+            yield {"quality_reviewer": {"messages": [FakeMsg()], "is_approved": True, "reviewer_feedback": "OK"}}
+
+    monkeypatch.setattr(fleet_api, "build_architecture", lambda: TaskEventEngine())
+
+    fleet_api._run_fleet_worker("task-ev-1", "SCRUM-3", "/workspace", threading.Event())
+
+    assert job.status == "approved"
+
+
+def test_worker_borra_checkpoints_al_estado_final(monkeypatch):
+    """Req 1.3: al alcanzar estado final, se eliminan los checkpoints del thread."""
+    import sys, os, threading
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agile_scripts'))
+    import fleet_api
+
+    job = fleet_api.JobState(job_id="ck-1", ticket_id="SCRUM-5", workspace="/workspace")
+    fleet_api._jobs["ck-1"] = job
+    monkeypatch.setattr(fleet_api, "_emit", lambda name, data: None)
+
+    deleted = []
+    monkeypatch.setattr(fleet_api, "delete_job_checkpoints", lambda job_id: deleted.append(job_id))
+
+    class FakeMsg:
+        content = "ok"
+
+    class DoneEngine:
+        def stream(self, initial, config=None, stream_mode=None):
+            yield {"quality_reviewer": {"messages": [FakeMsg()], "is_approved": True, "reviewer_feedback": "OK"}}
+
+    monkeypatch.setattr(fleet_api, "build_architecture", lambda: DoneEngine())
+
+    fleet_api._run_fleet_worker("ck-1", "SCRUM-5", "/workspace", threading.Event())
+
+    assert job.status == "approved"
+    assert deleted == ["ck-1"]

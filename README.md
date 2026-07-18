@@ -46,6 +46,9 @@ El fleet queda disponible en `http://localhost:8000` y el dashboard en tiempo re
 | `WORKSPACE_DIR` | Ruta absoluta del proyecto de software que la flota modificará |
 | `FLEET_ASYNC_WORKERS` | Workers para jobs async (default: `8`) |
 | `FLEET_WAIT_WORKERS` | Workers para requests síncronos (default: `4`) |
+| `FLEET_CHECKPOINT_DB` | Archivo SQLite de checkpoints durables de LangGraph (default: `/data/n8n_store/checkpoints.db`). Un job interrumpido por crash/reinicio se reanuda desde su último checkpoint en vez de redespachar desde cero |
+| `FLEET_AUTO_RESUME` | `true` = al arrancar, los jobs interrumpidos se reanudan solos desde su checkpoint; cualquier otro valor = quedan en status `interrupted` para reanudación manual vía `POST /resume/{job_id}` (default: `false`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Endpoint OTLP para trazas OpenTelemetry (default en compose: `http://jaeger:4318`; UI de Jaeger en `http://localhost:16686`). Vacío = tracing deshabilitado. Los spans incluyen modelo/tokens/ciclo por invocación LLM — nunca contenido de prompts |
 
 ---
 
@@ -60,8 +63,14 @@ curl -X POST http://localhost:8000/run \
 # Ver estado del job
 curl http://localhost:8000/status/<job_id>
 
+# Reanudar un job interrumpido por crash/reinicio (status "interrupted")
+curl -X POST http://localhost:8000/resume/<job_id>
+
 # Dashboard en tiempo real
 open http://localhost:8000/
+
+# Trazas OpenTelemetry (un trace por job, spans por nodo y por invocación LLM)
+open http://localhost:16686/
 ```
 
 ---
