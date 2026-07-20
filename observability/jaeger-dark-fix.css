@@ -67,3 +67,15 @@ rect[fill="#fff"], rect[fill="#ffffff"], rect[fill="white"] { fill: #1a2130 !imp
 .TracePageHeader--overviewItems, .TracePageHeader--overviewItems * { color: rgba(244,248,255,0.85) !important; }
 .TracePageHeader--traceName { color: rgba(244,248,255,0.92) !important; }
 .TickLabels--label { color: rgba(244,248,255,0.55) !important; }
+
+/* Botón "atrás" del header de la traza: fondo blanco (#fafafa) hardcodeado
+ * detrás de la flecha, sobre el header oscuro. */
+.TracePageHeader--back { background-color: #1a2130 !important; }
+.TracePageHeader--back:hover { background-color: #1e2735 !important; }
+
+/* Panel de detalle del span (se abre/hover al clickear una fila): el fondo
+ * claro (#f5f5f5/#f8f8f8) queda hardcodeado y el texto claro del tema dark
+ * se vuelve ilegible encima. */
+.span-view:hover, .ub-relative.span-view:hover { background-color: #1e2735 !important; }
+.detail-info-wrapper { background-color: #1a2130 !important; }
+.detail-info-wrapper .ant-divider { border-color: #2c3648 !important; }
