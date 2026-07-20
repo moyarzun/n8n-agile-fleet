@@ -42,3 +42,10 @@ rect[fill="#fff"], rect[fill="#ffffff"], rect[fill="white"] { fill: #1a2130 !imp
 .Page--topNav a { color: rgba(244,248,255,0.92) !important; }
 .Page--topNav .ant-menu-item-selected a { color: #0f141c !important; }
 .Page--topNav .ant-menu-item:hover a { color: #ffffff !important; }
+
+/* Iconos de ordenamiento en los headers de la tabla: heredan el negro
+ * (rgba(0,0,0,0.294)) sobre fondo oscuro. Tenue-visible en reposo, teal al
+ * estar activos, un poco más brillante al hover de la columna. */
+.ant-table-column-sorter-up, .ant-table-column-sorter-down { color: rgba(244,248,255,0.35) !important; }
+.ant-table-column-sorter-up.active, .ant-table-column-sorter-down.active { color: #4fd0e0 !important; }
+.ant-table-column-sorters:hover .ant-table-column-sorter { color: rgba(244,248,255,0.55) !important; }
