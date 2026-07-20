@@ -49,3 +49,21 @@ rect[fill="#fff"], rect[fill="#ffffff"], rect[fill="white"] { fill: #1a2130 !imp
 .ant-table-column-sorter-up, .ant-table-column-sorter-down { color: rgba(244,248,255,0.35) !important; }
 .ant-table-column-sorter-up.active, .ant-table-column-sorter-down.active { color: #4fd0e0 !important; }
 .ant-table-column-sorters:hover .ant-table-column-sorter { color: rgba(244,248,255,0.55) !important; }
+
+/* Vista de trazas (Trace Timeline): la cabecera, la fila de stats, el minimap
+ * y el header de la timeline traen fondos claros hardcodeados (#fff/#eee/#ececec),
+ * y varios textos (nombre de servicio, toggles del árbol) van en negro. Con
+ * fondos oscuros el "Auto Dark Mode" de Chrome ya no los invierte y quedan
+ * legibles en ambos casos (con y sin ese modo). */
+.Tracepage--headerSection, .TracePageHeader--titleRow { background-color: #141a24 !important; }
+.TracePageHeader--overviewItems { background-color: #1a2130 !important; }
+.Tracepage--headerSection .ub-pb2.ub-px2 { background-color: #141a24 !important; }
+.CanvasSpanGraph { background-color: #1a2130 !important; }
+.TimelineHeaderRow { background-color: #1a2130 !important; }
+.span-name-wrapper { background-color: transparent !important; }
+.span-row:hover .span-name-wrapper, .span-row.is-expanded .span-name-wrapper { background-color: #1e2735 !important; }
+.span-svc-name, .span-operation-name { color: rgba(244,248,255,0.92) !important; }
+.SpanTreeOffset, .SpanTreeOffset--iconWrapper, .SpanTreeOffset a { color: rgba(244,248,255,0.65) !important; }
+.TracePageHeader--overviewItems, .TracePageHeader--overviewItems * { color: rgba(244,248,255,0.85) !important; }
+.TracePageHeader--traceName { color: rgba(244,248,255,0.92) !important; }
+.TickLabels--label { color: rgba(244,248,255,0.55) !important; }
