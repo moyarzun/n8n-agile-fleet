@@ -1,0 +1,37 @@
+/*
+ * Arreglo del modo oscuro de Jaeger UI v1.76 (inyectado por el proxy nginx).
+ *
+ * Bug: el tema dark de Jaeger aplica data-theme="dark" y pone el TEXTO en color
+ * claro (rgba(244,248,255,...)), pero nunca aplica el FONDO oscuro (html/body/
+ * #jaeger-ui-root quedan transparentes → blanco del navegador). Resultado:
+ *  - Sin "Auto Dark Mode" de Chrome: texto claro sobre fondo blanco (ilegible).
+ *  - Con "Auto Dark Mode" de Chrome: la página se re-invierte → texto oscuro
+ *    sobre fondo oscuro (ilegible).
+ *
+ * Fix: aportar el fondo oscuro que falta y declarar color-scheme:dark para que
+ * el force-dark de Chrome respete el dark nativo y no lo re-invierta.
+ */
+:root { color-scheme: dark !important; }
+html, body, #jaeger-ui-root { background-color: #141a24 !important; }
+
+/* Tabla de operaciones: heredar el fondo oscuro; hover legible */
+.ant-table, .ant-table-container, .ant-table-thead > tr > th,
+.ant-table-tbody > tr > td, .ant-table-cell { background-color: transparent !important; }
+.ant-table-tbody > tr:hover > td, .ant-table-cell-row-hover { background-color: #1e2735 !important; }
+
+/* Tarjetas de gráficos y ejes (recharts pinta un rect blanco de fondo) */
+.graph-container { background-color: #1a2130 !important; border-radius: 6px; }
+.recharts-surface { background-color: transparent !important; }
+.recharts-cartesian-grid line { stroke: #2c3648 !important; }
+.recharts-text tspan, .recharts-cartesian-axis-tick-value tspan { fill: rgba(244,248,255,0.65) !important; }
+rect[fill="#fff"], rect[fill="#ffffff"], rect[fill="white"] { fill: #1a2130 !important; }
+
+/* Banner de aviso de Jaeger */
+.ant-alert-warning { background-color: #2a2410 !important; border-color: #5c4a12 !important; }
+.ant-alert-warning .ant-alert-message, .ant-alert-warning a { color: #f4d35e !important; }
+
+/* Inputs y selects */
+.ant-input, .ant-input-affix-wrapper, .ant-select-selector {
+  background-color: #1a2130 !important; color: rgba(244,248,255,0.92) !important; border-color: #2c3648 !important;
+}
+.ant-input::placeholder { color: rgba(244,248,255,0.4) !important; }
