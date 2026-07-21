@@ -393,3 +393,103 @@ def test_no_reescribas_con_edicion_acotada_no_bloquea_por_nombre(real_fleet, tmp
 
     assert applied == ["src/lib/waitlist.test.ts"]
     assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 19: _FILE_PATH_RE no reconocía paréntesis literales en rutas
+# de archivo — "route groups" de Next.js App Router / Expo Router (`(tabs)`,
+# `(marketing)`) cortaban la ruta en el paréntesis y la guarda de alcance
+# nunca reconocía el path real.
+# ---------------------------------------------------------------------------
+
+def test_mentioned_file_paths_no_trunca_tsx_a_ts(real_fleet):
+    """Bug encontrado escribiendo los tests del req 19 (no reportado en el
+    hallazgo original, pero mismo mecanismo — _FILE_PATH_RE): la alternación
+    de extensiones probaba 'ts' antes que 'tsx', truncando CUALQUIER mención
+    de un archivo .tsx a .ts (y 'package.json' a 'package.js', por el mismo
+    problema con 'js' antes de 'json')."""
+    mentioned = real_fleet._mentioned_file_paths("Edita src/components/Foo.tsx por favor.")
+    assert "src/components/Foo.tsx" in mentioned
+    assert "src/components/Foo.ts" not in mentioned
+
+    mentioned_json = real_fleet._mentioned_file_paths("Agrega una dependencia a package.json.")
+    assert "package.json" in mentioned_json
+    assert "package.js" not in mentioned_json
+
+
+def test_mentioned_file_paths_reconoce_parentesis_de_route_group(real_fleet):
+    """Criterio de aceptación 1 (caso exacto del hallazgo): el path con
+    'route group' de Expo Router debe extraerse completo, no cortado en '('."""
+    criteria = "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`."
+    mentioned = real_fleet._mentioned_file_paths(criteria)
+    assert "mobile/app/(tabs)/index.tsx" in mentioned
+
+
+def test_ticket_sobre_archivo_con_route_group_no_se_rechaza_por_alcance(real_fleet, tmp_path):
+    """Criterio de aceptación 2: reproduce TASK-80de0a0a — un requerimiento
+    que menciona únicamente mobile/app/(tabs)/index.tsx como alcance permitido,
+    y un ticket que efectivamente escribe ahí, no debe rechazarse."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    (tabs_dir / "index.tsx").write_text("export default function Index() { return null; }\n")
+
+    criteria = (
+        "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx` (el path del archivo "
+        "tiene paréntesis literales en el nombre de carpeta \"(tabs)\", tenlo en "
+        "cuenta al escribir la ruta exacta)."
+    )
+    llm_response = _file_block(
+        "mobile/app/(tabs)/index.tsx",
+        "export default function Index() { return <View />; }\n",
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/app/(tabs)/index.tsx"]
+    assert rejected == []
+
+
+def test_archivo_fuera_del_route_group_mencionado_sigue_rechazado(real_fleet, tmp_path):
+    """No regression: con un path con paréntesis correctamente reconocido, un
+    archivo EXISTENTE distinto y fuera de ese árbol sigue rechazándose por la
+    guarda de alcance — el fix no desactiva la protección, solo repara el
+    parseo del path con paréntesis."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    (tabs_dir / "index.tsx").write_text("export default function Index() { return null; }\n")
+    other_dir = tmp_path / "mobile" / "lib"
+    other_dir.mkdir(parents=True)
+    (other_dir / "unrelated.ts").write_text("export const x = 1;\n")
+
+    criteria = "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`."
+    llm_response = (
+        _file_block("mobile/app/(tabs)/index.tsx", "export default function Index() { return <View />; }\n")
+        + "\n" + _file_block("mobile/lib/unrelated.ts", "export const x = 2;\n")
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/app/(tabs)/index.tsx"]
+    assert len(rejected) == 1
+    assert "unrelated.ts" in rejected[0]
+
+
+def test_codebase_reader_lee_archivo_con_route_group_como_contexto(real_fleet, tmp_path):
+    """Criterio de investigación 2: codebase_reader_node (ahora unificado con
+    _FILE_PATH_RE) debe capturar el contenido real de un archivo con
+    paréntesis en el path como contexto, no solo la guarda de alcance."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    original = "export default function Index() { return null; }\n"
+    (tabs_dir / "index.tsx").write_text(original)
+
+    state = {
+        "workspace_path": str(tmp_path),
+        "stack": "generic",
+        "subtasks": [],
+        "acceptance_criteria": "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`.",
+    }
+    result = real_fleet.codebase_reader_node(state)
+    existing = result["existing_files"]
+    assert "mobile/app/(tabs)/index.tsx" in existing
+    assert existing["mobile/app/(tabs)/index.tsx"] == original

@@ -592,8 +592,24 @@ def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
 # Extensión de ruta de archivo de código/config que reconocemos al parsear
 # rutas dentro del texto del requerimiento (mismo set que codebase_reader).
 # Los corchetes `[]` permiten capturar rutas dinámicas de Next.js
-# (`[param]`) — ver requerimiento 16.
-_FILE_PATH_RE = r"[\w/\-\.\[\]]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|yaml|yml|md|sh|css|scss|html|vue)"
+# (`[param]`) — ver requerimiento 16. Los paréntesis `()` permiten capturar
+# "route groups" de Next.js App Router / Expo Router (`(tabs)`, `(marketing)`,
+# `(dashboard)`) — ver requerimiento 19: sin ellos, `mobile/app/(tabs)/index.tsx`
+# se cortaba en el paréntesis y la guarda de alcance nunca reconocía el path
+# real, rechazando el único archivo mencionado en el ticket.
+#
+# Orden de la alternación de extensiones: las MÁS LARGAS van antes que
+# cualquier prefijo suyo (tsx antes de ts, jsx/json antes de js) — descubierto
+# escribiendo los tests de regresión del requerimiento 19. La alternación de
+# regex prueba las opciones en orden y se queda con la PRIMERA que matchea,
+# no la más larga: con el orden viejo (ts antes que tsx), al hacer backtrack
+# sobre `[...]+\.` el motor encontraba el único punto disponible (el de
+# ".tsx") y ahí "ts" matcheaba antes que "tsx" pudiera intentarse, dejando la
+# "x" final afuera del match. Bug real y con impacto amplio: CUALQUIER
+# mención de un archivo `.tsx`/`.jsx` en el texto de un requerimiento se
+# reconocía truncada a `.ts`/`.js` — y "package.json" se truncaba a
+# "package.js" (mismo problema, "js" antes que "json").
+_FILE_PATH_RE = r"[\w/\-\.\[\]\(\)]+\.(?:tsx|ts|jsx|json|js|prisma|sql|rb|py|go|rs|yaml|yml|md|sh|css|scss|html|vue)"
 
 # Requerimiento 15: frases de prohibición explícita por nombre de archivo. El
 # req 11 solo cubría el caso "companion no mencionado"; acá se cubre el caso
@@ -1887,15 +1903,12 @@ def codebase_reader_node(state: FleetState) -> dict:
     # filesystem), y el modelo termina alucinando una versión propia del
     # contenido a partir del nombre/descripción (ver requerimiento 08).
     text = "\n".join(subtasks) + "\n" + criteria
-    # Los corchetes `[]` en la clase permiten capturar rutas dinámicas de
-    # Next.js (ej. `src/app/api/messages/[conversationId]/route.ts`) —
-    # requerimiento 16: sin ellos, esos archivos nunca se leían como contexto
-    # ni se comparaban en regression_guard, y una pérdida de handler pasaba
-    # inadvertida.
-    found = _re.findall(
-        r'[\w/\-\.\[\]]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml|md)',
-        text
-    )
+    # Usa el mismo _FILE_PATH_RE que _is_out_of_scope/_find_explicitly_forbidden_files
+    # (antes tenía su propia copia del regex, desincronizada — el fix del req
+    # 16 para corchetes `[]` de rutas dinámicas de Next.js nunca se propagó
+    # acá, y el mismo hueco reapareció con paréntesis `()` de route groups en
+    # el req 19; unificar en la constante compartida evita que se repita).
+    found = _re.findall(_FILE_PATH_RE, text)
     candidates = list(dict.fromkeys(
         _KEY_FILES_BY_STACK.get(stack, []) + found
     ))
