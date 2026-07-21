@@ -145,19 +145,23 @@ def _make_or(model: str, temperature: float, timeout: int = 900) -> ChatOpenAI:
         },
     )
 
+
+# 2026-07-20: "qwen/qwen3-coder:free" y "meta-llama/llama-3.3-70b-instruct:free"
+# fueron dados de baja por OpenRouter (404 NotFoundError constante, ~55% de los
+# errores de la flota en 24h). Reemplazados por modelos free vigentes con
+# perfil similar (coder-agent / general-instruct). Verificar catálogo vivo con
+# GET https://openrouter.ai/api/v1/models antes de reintroducir un slug caído.
 _OR_DEV_CHAIN = [
     _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.3),
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.3),
-    _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.3),
+    _make_or("cohere/north-mini-code:free", 0.3),
+    _make_or("poolside/laguna-m.1:free", 0.3),
 ]
-
-# Para desarrollo: Qwen 3 Coder como modelo primario (mejor seguimiento de formato FILE_BEGIN/END)
-_qwen_dev = _make_or("qwen/qwen3-coder:free", 0.3)
 
 _OR_REVIEWER_CHAIN = [
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.0),
     _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.0),
-    _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.0),
+    _make_or("google/gemma-4-31b-it:free", 0.0),
 ]
 
 
@@ -373,9 +377,13 @@ def _invoke_chain(primary, fallback_chain: list, messages: list) -> object:
 
 
 def _invoke_dev(messages: list) -> object:
-    # Orden: Qwen Coder → Nemotron Ultra → Nemotron Super → Llama → MiniMax (último recurso)
-    # MiniMax va al final: responde rápido pero no sigue el formato FILE_BEGIN/END
-    return _invoke_chain(_qwen_dev, _OR_DEV_CHAIN + [_minimax_dev], messages)
+    # MiniMax primero en todos los roles (2026-07-20): la cadena free previa
+    # (Qwen Coder → Nemotron × 2 → Llama) causaba ~55% NotFoundError (slugs
+    # dados de baja por OpenRouter) + rate-limit diario compartido entre
+    # modelos free, agregando latencia y errores en cada ciclo del dev. Si
+    # MiniMax no sigue el formato FILE_BEGIN/END en la práctica, revisar
+    # trazas — se mantiene la cadena free como fallback real.
+    return _invoke_chain(_minimax_dev, _OR_DEV_CHAIN, messages)
 
 
 def _invoke_reviewer(messages: list) -> object:
@@ -571,11 +579,31 @@ _FILE_PATH_RE = r"[\w/\-\.\[\]]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|y
 # req 11 solo cubría el caso "companion no mencionado"; acá se cubre el caso
 # opuesto y más fuerte — el requerimiento nombra el archivo y dice que NO se
 # toque. Ese archivo debe ser hard-reject si el agente lo modifica igual.
+#
+# Requerimiento 17: "no reescribas"/"no reescribir" se sacaron de esta lista.
+# A diferencia de "no modifiques"/"no toques" (que esperan CERO cambios en el
+# archivo), "no reescribas X, solo agrega/cambia Y" autoriza una edición
+# acotada — por definición espera algún cambio. Bloquearlo por nombre como
+# hard-reject impedía la propia edición pequeña que la frase pedía (caso real:
+# TASK-ce8abf86/TASK-4bdedf6f). El riesgo real que "no reescribas" busca
+# prevenir — que el agente reescriba el archivo completo en vez de editarlo
+# puntualmente — ya lo cubren las guardas 1/2 de `_apply_workspace_changes`
+# (detección de reescritura >30% por tamaño/líneas), que sí distinguen una
+# edición chica de una reescritura completa.
 _FORBID_MARKERS = (
     "no modifiques", "no modificar", "no toques", "no tocar", "no edites",
-    "no editar", "no cambies", "no cambiar", "no reescribas", "no reescribir",
+    "no editar", "no cambies", "no cambiar",
     "no alteres", "no alterar", "sin tocar", "sin modificar", "no modifica",
 )
+
+# Requerimiento 17, criterio 1: calificadores que INVIERTEN el sentido de la
+# prohibición cuando aparecen entre el verbo prohibitivo y el path — "no
+# toques ningún archivo FUERA DE X" es un allow-list (permite SOLO X),
+# exactamente lo opuesto de "no toques X". Si alguno de estos aparece antes
+# del path capturado, esa coincidencia se descarta — el path NO se agrega a
+# la lista de prohibidos (queda cubierto, correctamente, por `_is_out_of_scope`
+# vía `_mentioned_file_paths`, que sí entiende el caso allow-list).
+_SCOPE_INVERSION_MARKERS = ("fuera de", "excepto", "salvo", "que no sea", "distinto de")
 
 
 def _mentioned_file_paths(criteria: str) -> set:
@@ -590,7 +618,14 @@ def _find_explicitly_forbidden_files(criteria: str) -> set:
     criterio 1). Busca cada frase de prohibición (_FORBID_MARKERS) y captura
     la primera ruta de archivo que aparezca en una ventana de texto posterior
     (misma oración/instrucción). Devuelve el set de rutas prohibidas —
-    hard-reject si el agente las modifica igual."""
+    hard-reject si el agente las modifica igual.
+
+    Requerimiento 17: si entre el verbo prohibitivo y el path aparece un
+    calificador de inversión de alcance (_SCOPE_INVERSION_MARKERS — "fuera
+    de", "excepto", "salvo", "que no sea", "distinto de"), la frase es un
+    allow-list ("no toques nada FUERA DE X" = "solo puedes tocar X") y no un
+    deny-list — ese path NO se agrega a `forbidden` (es, de hecho, uno de los
+    archivos que sí se espera que se toquen)."""
     if not criteria:
         return set()
     forbidden = set()
@@ -604,9 +639,11 @@ def _find_explicitly_forbidden_files(criteria: str) -> set:
             # Ventana desde el marcador: el path prohibido aparece justo después
             # ("no modifiques `src/server/auth/context.ts` en este ticket...").
             window = criteria[idx: idx + 160]
-            paths = _re.findall(_FILE_PATH_RE, window)
-            if paths:
-                forbidden.add(paths[0])
+            path_match = _re.search(_FILE_PATH_RE, window)
+            if path_match:
+                text_before_path = window[:path_match.start()].lower()
+                if not any(inv in text_before_path for inv in _SCOPE_INVERSION_MARKERS):
+                    forbidden.add(path_match.group(0))
             start = idx + len(marker)
     return forbidden
 

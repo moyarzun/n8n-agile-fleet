@@ -285,3 +285,111 @@ def test_requerimiento_sin_rutas_no_activa_guarda_de_alcance(real_fleet, tmp_pat
 
     assert applied == ["src/cualquier-cosa.ts"]
     assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 17: falso positivo de la guarda de exclusión explícita (req 15)
+# con frases allow-list ("fuera de") y con "no reescribas X, solo agrega Y".
+# ---------------------------------------------------------------------------
+
+def test_fuera_de_no_agrega_el_path_a_prohibidos(real_fleet):
+    """Criterio de aceptación 1/2 (caso exacto del hallazgo): 'no toques
+    ningún archivo fuera de X' es un allow-list — X no debe quedar prohibido."""
+    criteria = (
+        "NO toques ningún archivo fuera de `src/lib/waitlist.ts`, "
+        "`src/lib/waitlist.test.ts`, `src/app/api/waitlist/route.ts`."
+    )
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/lib/waitlist.ts" not in forbidden
+
+
+def test_fuera_de_no_rechaza_la_escritura_del_archivo_permitido(real_fleet, tmp_path):
+    """Criterio de aceptación 2: reproduce el caso exacto — con la frase
+    'fuera de', escribir src/lib/waitlist.ts (el archivo permitido, no el
+    prohibido) no debe ser rechazado por la guarda de exclusión explícita."""
+    lib = tmp_path / "src" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "waitlist.ts").write_text("export function old() {}\n")
+
+    criteria = "NO toques ningún archivo fuera de `src/lib/waitlist.ts`."
+    llm_response = _file_block("src/lib/waitlist.ts", "export function promoteNextInWaitlist() {}\n")
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.ts"]
+    assert rejected == []
+
+
+@pytest.mark.parametrize("qualifier", ["excepto", "salvo", "que no sea", "distinto de"])
+def test_otros_calificadores_de_inversion_tambien_invalidan_la_prohibicion(real_fleet, qualifier):
+    """Criterio de aceptación 1: variantes de 'fuera de' — excepto/salvo/que no
+    sea/distinto de — deben comportarse igual."""
+    criteria = f"No modifiques ningún archivo {qualifier} `src/lib/waitlist.ts` en este ticket."
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/lib/waitlist.ts" not in forbidden
+
+
+def test_sin_calificador_de_inversion_sigue_prohibiendo_como_antes(real_fleet):
+    """No regression: 'no modifiques X' sin calificador de inversión (el caso
+    que req 15 ya cubría) sigue prohibiendo X con normalidad."""
+    criteria = "No modifiques `src/server/auth/context.ts` en este ticket."
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/server/auth/context.ts" in forbidden
+
+
+def test_is_out_of_scope_sigue_rechazando_el_complementario_con_fuera_de(real_fleet, tmp_path):
+    """Criterio de aceptación 3: con una frase 'fuera de', un archivo EXISTENTE
+    que sí está fuera de los paths permitidos debe seguir siendo rechazado —
+    por `_is_out_of_scope`, no por la guarda de exclusión explícita."""
+    (tmp_path / "src" / "lib").mkdir(parents=True)
+    (tmp_path / "src" / "server").mkdir(parents=True)
+    (tmp_path / "src" / "lib" / "waitlist.ts").write_text("export function old() {}\n")
+    (tmp_path / "src" / "server" / "errors.ts").write_text("export class AppError {}\n")
+
+    criteria = "NO toques ningún archivo fuera de `src/lib/waitlist.ts`."
+    llm_response = (
+        _file_block("src/lib/waitlist.ts", "export function promoteNextInWaitlist() {}\n")
+        + "\n" + _file_block("src/server/errors.ts", "export class AppError extends Error {}\n")
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.ts"]
+    assert len(rejected) == 1
+    assert "errors.ts" in rejected[0]
+
+
+def test_no_reescribas_con_edicion_acotada_no_bloquea_por_nombre(real_fleet, tmp_path):
+    """Criterio de aceptación 4: reproduce TASK-ce8abf86/TASK-4bdedf6f — 'no
+    reescribas X, solo agrega Y' ya no dispara la guarda de exclusión
+    explícita por nombre; una edición chica (no una reescritura completa) se
+    aplica con normalidad."""
+    lib = tmp_path / "src" / "lib"
+    lib.mkdir(parents=True)
+    original = (
+        "import { describe, it, expect } from 'vitest';\n\n"
+        "describe('promoteNextInWaitlist', () => {\n"
+        "  it('test 1', () => { expect(true).toBe(true); });\n"
+        "  it('test 2', () => { expect(true).toBe(true); });\n"
+        "  it('test 3', () => { expect(true).toBe(true); });\n"
+        "  it('test 4', () => { expect(true).toBe(true); });\n"
+        "});\n"
+    )
+    (lib / "waitlist.test.ts").write_text(original)
+
+    criteria = (
+        "src/lib/waitlist.test.ts (archivo YA EXISTENTE con 4 tests — "
+        "NO reescribas el archivo, solo AGREGA un test nuevo al final del "
+        "describe existente)."
+    )
+    edited = original.replace(
+        "});\n",
+        "  it('test 5 nuevo', () => { expect(true).toBe(true); });\n});\n",
+        1,
+    )
+    llm_response = _file_block("src/lib/waitlist.test.ts", edited)
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.test.ts"]
+    assert rejected == []
