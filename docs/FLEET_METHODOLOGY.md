@@ -182,6 +182,19 @@ Codificadas en `ENGINEERING_GUARDRAILS_*` (langgraph_fleet.py). Resumen:
 - **Grounding**: no inventar modelos; alinear al código existente.
 - **No placeholders**: `...`, `# TODO`, `# resto` = rechazo.
 - **Archivos completos**: el último carácter de FILE_BEGIN/END es el cierre real.
+- **Limitación conocida (requerimiento 18) — sin ejecución real de instalación**:
+  `dynamic_developer` es una llamada a un LLM que devuelve `FILE_BEGIN/END`, no un
+  agente con herramientas — no puede correr `npm install`, `npx expo install
+  --check`, `bundle install`, ni ningún comando de instalación real. Si el
+  requerimiento pide "correr" uno de esos comandos, el modelo alucina el
+  `package.json`/manifest resultante en vez de aplicar el cambio puntual. **Quien
+  despache debe evitar pedir "corre npm install X"** y en su lugar especificar
+  exactamente qué línea agregar al manifest (ej. "agrega `"jest-expo": "~54.0.0"`
+  a devDependencies"). El prompt del dev ya trae esta instrucción, y una guarda
+  determinista (`_find_unauthorized_package_json_dependency_changes`) rechaza
+  entero cualquier `package.json` que cambie de versión o elimine una dependencia
+  preexistente no mencionada por nombre — pero la guarda solo cubre npm/`package.json`;
+  no hay guarda equivalente todavía para `Gemfile`/`requirements.txt`.
 
 ### Rails:
 - Triangulación spec↔factory↔tabla obligatoria.
@@ -300,3 +313,10 @@ curl -s -X POST http://localhost:8000/solve \
 - **Métrica "first-pass test rate"**: cuántos tickets pasan el gate de vitest en el primer ciclo.
 - **Persistencia de cadena de fallos** por ticket para evitar errores repetidos entre ciclos.
 - **Test coverage report**: integrar istanbul/nyc y fallar si coverage baja del umbral.
+- **Requerimiento 18, prioridad media, pendiente**: señal de alerta en el log cuando
+  `package.json` cambia versiones pero el lockfile correspondiente no tiene diff (fuerte
+  indicio de que no hubo instalación real); `validation_gate` debería detectar tickets
+  100% dentro de un subdirectorio con su propio `package.json`/`tsconfig.json` (ej.
+  `mobile/`) y correr el `tsc`/test runner de ESE manifest en vez de (o además de) el
+  del proyecto raíz — hoy un ticket 100% `mobile/` puede pasar "✓ validado" sin ninguna
+  cobertura real sobre ese código.

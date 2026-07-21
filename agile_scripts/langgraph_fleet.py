@@ -261,6 +261,21 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 - No cambies next.config.mjs ni tsconfig.json sin necesidad.
 - Los Server Components no pueden tener 'use client' ni usar hooks de React.
 - Los Client Components deben tener 'use client' al inicio si usan useState/useEffect/hooks.
+
+[NO ALUCINES INSTALACIONES DE PAQUETES — limitación conocida, requerimiento 18]
+- No tenés forma de ejecutar `npm install`, `npx expo install --check`, ni ningún
+  comando de instalación real — no hay terminal ni proceso disponible desde acá.
+  Si el requerimiento pide "correr" uno de esos comandos, NO inventes cuál sería
+  el resultado del árbol de dependencias.
+- Para agregar una dependencia a package.json: edita SOLO agregando la(s)
+  línea(s) de dependencies/devDependencies pedida(s) por nombre, con la versión
+  que indique el requerimiento (o la última conocida si no la especifica). NO
+  toques la versión de ninguna OTRA dependencia ya presente, NO elimines
+  ninguna, NO cambies el campo "name" del paquete.
+- Un package.json con cualquier dependencia preexistente cambiada de versión o
+  eliminada sin que el requerimiento la mencione por nombre explícitamente se
+  rechaza automáticamente entero (guarda de dependencias) — se pierde el ciclo
+  completo si esto pasa.
 """.strip()
 
 ENGINEERING_GUARDRAILS_GENERIC = """
@@ -268,6 +283,11 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 - Escribe código completo y funcional. Sin placeholders ('...', 'TODO', 'rest of implementation').
 - Respeta el stack y lenguaje del proyecto existente. No introduzcas lenguajes ajenos.
 - Lee los archivos existentes antes de escribir para no romper interfaces ya definidas.
+- No tenés forma de ejecutar comandos de instalación de paquetes reales (npm install,
+  bundle install, pip install, etc.) — si el requerimiento pide "correr" uno de esos
+  comandos, no inventes su resultado. Editá el manifest de dependencias (package.json,
+  Gemfile, requirements.txt...) agregando SOLO lo pedido por nombre, sin tocar ni
+  eliminar ninguna entrada preexistente no mencionada.
 """.strip()
 
 def _get_guardrails(stack: str) -> str:
@@ -682,6 +702,64 @@ def _find_allow_rewrite_files(criteria: str) -> set:
     return {m.strip() for m in _re.findall(r"ALLOW_REWRITE:\s*([^\n\r]+)", criteria)}
 
 
+_PACKAGE_JSON_DEPENDENCY_FIELDS = (
+    "dependencies", "devDependencies", "peerDependencies", "optionalDependencies",
+)
+
+
+def _find_unauthorized_package_json_dependency_changes(
+    original_content: str, new_content: str, criteria: str,
+) -> list:
+    """Requerimiento 18: `dynamic_developer` no ejecuta `npm`/`npx` de verdad
+    — cuando el requerimiento pide "correr" una instalación, el LLM alucina
+    el `package.json` resultante en vez de aplicar el cambio puntual pedido
+    (caso real: TASK-2cd6964f, downgrades de 2 versiones mayores y 7 paquetes
+    eliminados sin pedirlo, con el lockfile completamente desincronizado).
+
+    Compara `dependencies`/`devDependencies`/`peerDependencies`/
+    `optionalDependencies` del `package.json` propuesto contra el original,
+    campo por campo. Cualquier dependencia PREEXISTENTE cuya versión cambió o
+    que fue eliminada es una violación — a menos que el requerimiento
+    mencione ese paquete por nombre explícitamente en su texto (autorización
+    real de tocarlo). Devuelve la lista de violaciones (vacía = sin
+    problemas); no valida altas nuevas de paquetes (agregar una dependencia
+    nueva es exactamente lo que suelen pedir estos tickets).
+
+    Si alguno de los dos contenidos no es JSON válido, no opina — eso ya lo
+    maneja el resto del pipeline (o el propio `npm install` al fallar)."""
+    try:
+        original = _json.loads(original_content)
+        new = _json.loads(new_content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(original, dict) or not isinstance(new, dict):
+        return []
+
+    # Tokens exactos del texto del requerimiento, no substring: un simple "in"
+    # haría que "react" cuente como "mencionado" solo por aparecer dentro de
+    # "react-native"/"react-test-renderer" — falso negativo que dejaría pasar
+    # justo el caso motivador de este requerimiento. `[@\w][\w./-]*` conserva
+    # los caracteres válidos de un nombre de paquete npm (@scope/nombre-con-guiones).
+    mentioned_tokens = {t.lower() for t in _re.findall(r"[@\w][\w./-]*", criteria or "")}
+    violations = []
+    for field in _PACKAGE_JSON_DEPENDENCY_FIELDS:
+        orig_deps = original.get(field)
+        new_deps = new.get(field)
+        if not isinstance(orig_deps, dict):
+            continue
+        new_deps = new_deps if isinstance(new_deps, dict) else {}
+        for name, orig_version in orig_deps.items():
+            if name.lower() in mentioned_tokens:
+                continue  # mencionado explícitamente por nombre -> autorizado
+            if name not in new_deps:
+                violations.append(f"{field}.{name}: eliminado (versión original {orig_version})")
+            elif new_deps[name] != orig_version:
+                violations.append(
+                    f"{field}.{name}: versión cambiada de {orig_version} a {new_deps[name]}"
+                )
+    return violations
+
+
 def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = "") -> tuple:
     """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco.
 
@@ -713,12 +791,18 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
        companion de un test mencionado) — hard-reject para evitar regresiones
        en código compartido no pedido (requerimiento 15, criterio 2). Solo
        aplica si el requerimiento menciona al menos una ruta.
+    7. Es un `package.json` existente y el contenido propuesto cambia la
+       versión o elimina una dependencia PREEXISTENTE que el requerimiento no
+       mencionó por nombre — señal de que el LLM alucinó el árbol de
+       dependencias en vez de ejecutar `npm`/`npx` de verdad, que no tiene
+       forma de hacer (requerimiento 18). Agregar una dependencia nueva no se
+       bloquea; solo cambios/bajas de las que ya estaban.
 
     Las guardas 1 y 2 (basadas en tamaño) se desactivan por archivo con la
     marca `ALLOW_REWRITE: <ruta>` en `criteria` (requerimiento 13): opt-out
     explícito para simplificaciones masivas intencionales, sin afectar a los
     demás archivos del ciclo. `ALLOW_REWRITE` NO desactiva las guardas de
-    alcance (5 y 6) — son de otra naturaleza.
+    alcance ni de contenido (5, 6 y 7) — son de otra naturaleza.
     """
     applied = []
     rejected = []
@@ -777,6 +861,35 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
             rejected.append(reason)
             logger.warning("Archivo %s rechazado: fuera del árbol de directorios del ticket", full_path)
             continue
+
+        # Guarda de dependencias no autorizadas en package.json (requerimiento
+        # 18): `dynamic_developer` no ejecuta npm de verdad, así que un cambio
+        # de versión/eliminación de una dependencia PREEXISTENTE que el
+        # requerimiento no mencionó por nombre es señal de que el LLM alucinó
+        # el árbol de dependencias en vez de aplicar el cambio puntual pedido.
+        # No depende de ALLOW_REWRITE (es una guarda de contenido/alcance
+        # semántico, no de tamaño).
+        if os.path.basename(rel_path) == "package.json" and os.path.exists(full_path):
+            try:
+                with open(full_path, "r", errors="ignore") as fh:
+                    original_package_json = fh.read()
+            except OSError:
+                original_package_json = ""
+            dep_violations = _find_unauthorized_package_json_dependency_changes(
+                original_package_json, content, criteria,
+            )
+            if dep_violations:
+                reason = (
+                    f"{rel_path}: cambios de dependencias no autorizados por el "
+                    f"requerimiento — {'; '.join(dep_violations)} — rechazado por "
+                    f"guarda de dependencias de package.json"
+                )
+                rejected.append(reason)
+                logger.warning(
+                    "Archivo %s rechazado: %d cambio(s) de dependencia no autorizado(s) (%s)",
+                    full_path, len(dep_violations), "; ".join(dep_violations),
+                )
+                continue
 
         protection = protected_impl_files.get(rel_path)
         if protection == "hard":
