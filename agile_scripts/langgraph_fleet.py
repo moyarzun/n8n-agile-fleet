@@ -760,6 +760,32 @@ def _find_unauthorized_package_json_dependency_changes(
     return violations
 
 
+_LOCKFILE_NAMES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml")
+
+
+def _package_json_dependencies_changed(original_content: str, new_content: str) -> bool:
+    """Requerimiento 18, punto 3: True si `dependencies`/`devDependencies`/
+    `peerDependencies`/`optionalDependencies` difieren en algo (alta, baja o
+    cambio de versión) entre el `package.json` original y el propuesto —
+    incluye altas nuevas autorizadas, a diferencia de
+    `_find_unauthorized_package_json_dependency_changes` (que solo mira
+    cambios NO autorizados). Se usa para decidir si vale la pena buscar un
+    lockfile hermano en la misma respuesta del LLM."""
+    try:
+        original = _json.loads(original_content)
+        new = _json.loads(new_content)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(original, dict) or not isinstance(new, dict):
+        return False
+    for field in _PACKAGE_JSON_DEPENDENCY_FIELDS:
+        orig_deps = original.get(field) if isinstance(original.get(field), dict) else {}
+        new_deps = new.get(field) if isinstance(new.get(field), dict) else {}
+        if orig_deps != new_deps:
+            return True
+    return False
+
+
 def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = "") -> tuple:
     """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco.
 
@@ -974,6 +1000,39 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
 
         candidates[rel_path] = content
 
+    # Requerimiento 18, punto 3: señal de alerta (no bloquea, solo log) cuando
+    # un package.json que sobrevivió a la guarda de dependencias no
+    # autorizadas SÍ cambió sus dependencias (alta/baja/versión autorizada),
+    # pero ningún lockfile hermano (package-lock.json/yarn.lock/pnpm-lock.yaml
+    # del mismo directorio) aparece en la misma respuesta del LLM — fuerte
+    # indicio de que ningún npm/yarn/pnpm install real corrió (dynamic_developer
+    # no tiene esa herramienta; ver requerimiento 18).
+    for rel_path, content in list(candidates.items()):
+        if os.path.basename(rel_path) != "package.json":
+            continue
+        full_path = os.path.join(workspace, rel_path)
+        if not os.path.exists(full_path):
+            continue  # package.json nuevo, sin "original" contra el cual comparar
+        try:
+            with open(full_path, "r", errors="ignore") as fh:
+                original_pkg = fh.read()
+        except OSError:
+            continue
+        if not _package_json_dependencies_changed(original_pkg, content):
+            continue
+        pkg_dir = os.path.dirname(rel_path)
+        lockfile_touched = any(
+            os.path.dirname(p) == pkg_dir and os.path.basename(p) in _LOCKFILE_NAMES
+            for p in candidates
+        )
+        if not lockfile_touched:
+            logger.warning(
+                "%s cambia dependencias pero ningún lockfile hermano (%s) aparece en "
+                "la misma respuesta del LLM — fuerte indicio de que ningún "
+                "npm/yarn/pnpm install real corrió (requerimiento 18, punto 3)",
+                full_path, "/".join(_LOCKFILE_NAMES),
+            )
+
     # Segunda pasada: chequeo cruzado Angular .ts/.html sobre lo que sobrevivió
     # a las guardas de arriba.
     for rel_path in list(candidates.keys()):
@@ -1153,6 +1212,34 @@ def _run_vitest_baseline(workspace: str, stack: str) -> Optional[set]:
     return _extract_failing_tests(out)
 
 
+def _find_subproject_root(applied_files: list, workspace: str) -> Optional[str]:
+    """Requerimiento 18, punto 4: si el 100% de los archivos aplicados del
+    ticket caen bajo un único subdirectorio de primer nivel que tiene su
+    propio package.json (ej. mobile/), ese subdirectorio es el "root" real
+    para tsc/vitest — el tsconfig/package.json de la raíz no lo incluye (caso
+    real: TASK-2cd6964f, 100% mobile/, pasó validation_gate con "✓" corriendo
+    tsc/vitest del proyecto Next.js raíz, que ni siquiera ve mobile/ — cero
+    cobertura real). Devuelve la ruta relativa del subproyecto, o None si no
+    aplica (algún archivo del ticket está en la raíz, o hay archivos en más
+    de un subdirectorio de primer nivel, o el subdirectorio no tiene su
+    propio package.json) — en ese caso el comportamiento es el de siempre:
+    tsc/vitest sobre la raíz del workspace."""
+    if not applied_files:
+        return None
+    top_dirs = set()
+    for f in applied_files:
+        parts = f.split("/", 1)
+        if len(parts) < 2:
+            return None  # archivo directamente en la raíz -> no es un subproyecto aislado
+        top_dirs.add(parts[0])
+    if len(top_dirs) != 1:
+        return None
+    subdir = next(iter(top_dirs))
+    if os.path.exists(os.path.join(workspace, subdir, "package.json")):
+        return subdir
+    return None
+
+
 def _validate_workspace(
     workspace: str, applied_files: list, stack: str = "generic",
     baseline_failing_tests: Optional[set] = None,
@@ -1169,6 +1256,21 @@ def _validate_workspace(
     report = []
     ran_any = False
     ok = True
+
+    # Requerimiento 18, punto 4: si el ticket es 100% un subproyecto con su
+    # propio package.json (ej. mobile/), tsc/vitest corren AHÍ en vez de en
+    # la raíz — la raíz no lo cubre. `subproject_prefix` normaliza las rutas
+    # de `applied_files` (que vienen relativas al workspace) a relativas del
+    # subproyecto, para que el filtrado de errores por archivo siga funcionando.
+    subproject = _find_subproject_root(applied_files, workspace) if stack == "node" else None
+    effective_root = os.path.join(workspace, subproject) if subproject else workspace
+    subproject_prefix = subproject + "/" if subproject else ""
+    if subproject:
+        report.append(
+            f"SUBPROYECTO DETECTADO: 100% de los archivos del ticket están bajo "
+            f"'{subproject}/', que tiene su propio package.json — TYPESCRIPT/VITEST "
+            f"corren ahí en vez de en la raíz del workspace (requerimiento 18)."
+        )
 
     # ── Nivel 1a: sintaxis Ruby (solo proyectos Rails) ─────────────────────
     rb_files = [f for f in applied_files if f.endswith(".rb")]
@@ -1195,18 +1297,25 @@ def _validate_workspace(
             rc, out = _run(
                 ["node", "--max-old-space-size=2048", "./node_modules/.bin/tsc",
                  "--noEmit", "--skipLibCheck", "--incremental", "false"],
-                cwd=workspace, timeout=180,
+                cwd=effective_root, timeout=180,
             )
+            tsc_label = f"tsc --noEmit, {subproject}/" if subproject else "tsc --noEmit"
             oom = "Last few GCs" in out or "heap out of memory" in out.lower() or "JavaScript heap" in out
             if oom:
                 # OOM no es fallo del código generado — avisar y continuar
-                report.append("TYPESCRIPT (tsc --noEmit): ⚠ OOM en el contenedor — check omitido")
+                report.append(f"TYPESCRIPT ({tsc_label}): ⚠ OOM en el contenedor — check omitido")
             elif rc == 0:
-                report.append("TYPESCRIPT (tsc --noEmit): ✓ sin errores de tipos")
+                report.append(f"TYPESCRIPT ({tsc_label}): ✓ sin errores de tipos")
             else:
                 # Filtrar errores en archivos que la flota NO generó (pre-existentes).
                 # Un error en un archivo ajeno no debe bloquear el trabajo de la flota.
-                applied_set = set(applied_files)
+                # Las rutas que reporta tsc son relativas a `effective_root`; si hay
+                # subproyecto, `applied_files` viene relativo al workspace (ej.
+                # "mobile/foo.ts") — hay que sacarle el prefijo para que coincida.
+                applied_set = {
+                    f[len(subproject_prefix):] if subproject_prefix and f.startswith(subproject_prefix) else f
+                    for f in applied_files
+                }
                 error_lines = out.strip().splitlines()
                 # Patrón: "ruta/archivo.ts(linea,col): error TSxxxx: ..."
                 fleet_errors = []
@@ -1227,27 +1336,34 @@ def _validate_workspace(
                             preexisting_errors.append(line)
 
                 # Errores de módulos mobile (react-native, expo) en archivos fleet son
-                # falsos positivos: el tsconfig web no ve esas deps. No bloquear.
+                # falsos positivos SOLO cuando tsc corrió sobre el tsconfig de la
+                # RAÍZ (que no ve esas deps). Si ya estamos corriendo tsc dentro del
+                # propio subproyecto mobile/ (su tsconfig SÍ resuelve esos módulos),
+                # un error ahí es real y no debe ignorarse.
                 _MOBILE_MODULES = (
                     "'react-native'", "'@expo/", "'expo-", "'react-native-",
                     "'@react-native", "@react-navigation",
                 )
-                real_fleet_errors = [
-                    l for l in fleet_errors
-                    if not any(m in l for m in _MOBILE_MODULES)
-                ]
-                env_mobile_errors = [
-                    l for l in fleet_errors if l not in real_fleet_errors
-                ]
+                if subproject:
+                    real_fleet_errors = fleet_errors
+                    env_mobile_errors = []
+                else:
+                    real_fleet_errors = [
+                        l for l in fleet_errors
+                        if not any(m in l for m in _MOBILE_MODULES)
+                    ]
+                    env_mobile_errors = [
+                        l for l in fleet_errors if l not in real_fleet_errors
+                    ]
 
                 if real_fleet_errors:
                     ok = False
                     tail = "\n".join(real_fleet_errors[-30:])
-                    report.append(f"TYPESCRIPT (tsc --noEmit): ✗\n{tail}")
+                    report.append(f"TYPESCRIPT ({tsc_label}): ✗\n{tail}")
                 else:
                     ignored = len(preexisting_errors) + len(env_mobile_errors)
                     report.append(
-                        f"TYPESCRIPT (tsc --noEmit): ✓ sin errores en archivos generados "
+                        f"TYPESCRIPT ({tsc_label}): ✓ sin errores en archivos generados "
                         f"(ignorados: {ignored} línea(s) pre-existentes o módulos mobile)"
                     )
 
@@ -1261,48 +1377,56 @@ def _validate_workspace(
             ".test." in f or (f.endswith(".spec.ts") and "e2e" not in f)
             for f in applied_files
         )
-        has_vitest_config = os.path.exists(os.path.join(workspace, "vitest.config.ts")) or \
-                            os.path.exists(os.path.join(workspace, "vitest.config.js"))
+        has_vitest_config = os.path.exists(os.path.join(effective_root, "vitest.config.ts")) or \
+                            os.path.exists(os.path.join(effective_root, "vitest.config.js"))
+        vitest_label = f"npx vitest run, {subproject}/" if subproject else "npx vitest run"
+        # El baseline (`_run_vitest_baseline`) siempre corre en la raíz del
+        # workspace, ANTES de saber si el ticket cae en un subproyecto — sus
+        # fallos no son comparables contra los de la suite de vitest de
+        # mobile/ (config, tests y hasta test runner distintos). Con
+        # subproyecto detectado, no lo usamos: cualquier fallo bloquea
+        # (mismo criterio estricto que cuando no hay baseline disponible).
+        effective_baseline = None if subproject else baseline_failing_tests
         if has_test_files or has_vitest_config:
             ran_any = True
             rc, out = _run(
                 ["node", "--max-old-space-size=2048", "./node_modules/.bin/vitest",
                  "run", "--reporter=verbose"],
-                cwd=workspace,
+                cwd=effective_root,
                 timeout=int(os.getenv("FLEET_VITEST_TIMEOUT", "180")),
             )
             tail = "\n".join(out.strip().splitlines()[-40:])
             if "Cannot find module" in out and "vitest" in out:
-                report.append("VITEST: ⚠ vitest no encontrado en node_modules — instala con npm install")
+                report.append(f"VITEST: ⚠ vitest no encontrado en node_modules de '{subproject or '.'}' — instala con npm install")
             elif rc == 0:
                 # Extraer resumen compacto de tests pasados
                 summary_match = _re.search(r'Test Files.*\n?.*Tests\s+\d+', out)
                 summary = summary_match.group(0).strip() if summary_match else f"exit 0"
-                report.append(f"VITEST (npx vitest run): ✓ {summary}\n{tail[-800:]}")
-            elif baseline_failing_tests is not None:
+                report.append(f"VITEST ({vitest_label}): ✓ {summary}\n{tail[-800:]}")
+            elif effective_baseline is not None:
                 # Requerimiento 10: aprobar por alcance del ticket, no exigir que
                 # TODA la suite esté verde. Solo bloquear si aparecen fallos
                 # NUEVOS que no estaban ya presentes antes de este despacho.
                 current_failing = _extract_failing_tests(out)
-                new_failures = current_failing - baseline_failing_tests
-                preexisting_still_failing = current_failing & baseline_failing_tests
+                new_failures = current_failing - effective_baseline
+                preexisting_still_failing = current_failing & effective_baseline
                 if new_failures:
                     ok = False
                     report.append(
-                        f"VITEST (npx vitest run): ✗ {len(new_failures)} fallo(s) NUEVO(S) "
+                        f"VITEST ({vitest_label}): ✗ {len(new_failures)} fallo(s) NUEVO(S) "
                         f"introducido(s) por este cambio (no relacionado con fallos "
                         f"preexistentes):\n" + "\n".join(sorted(new_failures)[:20])
                     )
                 else:
                     report.append(
-                        f"VITEST (npx vitest run): ✓ sin fallos nuevos "
+                        f"VITEST ({vitest_label}): ✓ sin fallos nuevos "
                         f"({len(preexisting_still_failing)} fallo(s) preexistente(s) "
                         f"no relacionados con este ticket, ya presentes antes del despacho, "
                         f"ignorados)\n{tail[-800:]}"
                     )
             else:
                 ok = False
-                report.append(f"VITEST (npx vitest run): ✗ exit {rc}\n{tail}")
+                report.append(f"VITEST ({vitest_label}): ✗ exit {rc}\n{tail}")
         else:
             report.append(
                 "VITEST: ⚠ no hay archivos *.test.ts ni vitest.config.ts detectados. "

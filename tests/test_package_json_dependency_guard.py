@@ -11,6 +11,7 @@ eliminación de 7 paquetes usados activamente — nada de eso estaba en el
 requerimiento.
 """
 import json
+import logging
 
 import pytest
 
@@ -192,3 +193,90 @@ def test_package_json_nuevo_no_activa_la_guarda(real_fleet, tmp_path):
 
     assert applied == ["nuevo-paquete/package.json"]
     assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 18, punto 3 (prioridad media): señal de alerta si package.json
+# cambia dependencias sin que el lockfile hermano aparezca en la misma
+# respuesta del LLM.
+# ---------------------------------------------------------------------------
+
+def test_package_json_dependencies_changed_detecta_alta_nueva(real_fleet):
+    new_pkg = json.loads(json.dumps(ORIGINAL_PACKAGE_JSON))
+    new_pkg["devDependencies"]["jest-expo"] = "~54.0.0"
+    assert real_fleet._package_json_dependencies_changed(
+        json.dumps(ORIGINAL_PACKAGE_JSON), json.dumps(new_pkg),
+    ) is True
+
+
+def test_package_json_dependencies_changed_false_si_es_identico(real_fleet):
+    assert real_fleet._package_json_dependencies_changed(
+        json.dumps(ORIGINAL_PACKAGE_JSON), json.dumps(ORIGINAL_PACKAGE_JSON),
+    ) is False
+
+
+def test_alerta_de_lockfile_faltante_cuando_deps_cambian_sin_lockfile(real_fleet, tmp_path, caplog):
+    """Criterio del punto 3: agregar una devDependency autorizada sin tocar
+    package-lock.json en la misma respuesta debe loguear un warning explícito
+    (no bloquea — es señal, no guarda dura)."""
+    mobile = tmp_path / "mobile"
+    mobile.mkdir()
+    (mobile / "package.json").write_text(json.dumps(ORIGINAL_PACKAGE_JSON, indent=2) + "\n")
+
+    new_pkg = json.loads(json.dumps(ORIGINAL_PACKAGE_JSON))
+    new_pkg["devDependencies"]["jest-expo"] = "~54.0.0"
+
+    criteria = "Desde mobile/, agregar jest-expo como devDependency."
+    llm_response = _file_block("mobile/package.json", json.dumps(new_pkg, indent=2) + "\n")
+
+    with caplog.at_level(logging.WARNING):
+        applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/package.json"]
+    assert rejected == []
+    assert any("ningún lockfile hermano" in r.message for r in caplog.records)
+
+
+def test_sin_alerta_si_el_lockfile_hermano_viene_en_la_misma_respuesta(real_fleet, tmp_path, caplog):
+    """Caso negativo: si package-lock.json SÍ viene en la misma respuesta
+    (indicio de que un install real corrió), no debe loguearse la alerta."""
+    mobile = tmp_path / "mobile"
+    mobile.mkdir()
+    (mobile / "package.json").write_text(json.dumps(ORIGINAL_PACKAGE_JSON, indent=2) + "\n")
+    (mobile / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3}, indent=2) + "\n")
+
+    new_pkg = json.loads(json.dumps(ORIGINAL_PACKAGE_JSON))
+    new_pkg["devDependencies"]["jest-expo"] = "~54.0.0"
+
+    criteria = "Desde mobile/, agregar jest-expo como devDependency."
+    llm_response = (
+        _file_block("mobile/package.json", json.dumps(new_pkg, indent=2) + "\n")
+        + "\n" + _file_block("mobile/package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {}}, indent=2) + "\n")
+    )
+
+    with caplog.at_level(logging.WARNING):
+        applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert set(applied) == {"mobile/package.json", "mobile/package-lock.json"}
+    assert rejected == []
+    assert not any("ningún lockfile hermano" in r.message for r in caplog.records)
+
+
+def test_sin_alerta_si_las_dependencias_no_cambiaron(real_fleet, tmp_path, caplog):
+    """Caso negativo: tocar package.json por otro motivo (ej. agregar un
+    script) sin cambiar dependencias no debe disparar la alerta de lockfile."""
+    mobile = tmp_path / "mobile"
+    mobile.mkdir()
+    (mobile / "package.json").write_text(json.dumps(ORIGINAL_PACKAGE_JSON, indent=2) + "\n")
+
+    new_pkg = json.loads(json.dumps(ORIGINAL_PACKAGE_JSON))
+    new_pkg["scripts"] = {"test": "jest"}
+
+    criteria = "Agregar un script 'test' a mobile/package.json."
+    llm_response = _file_block("mobile/package.json", json.dumps(new_pkg, indent=2) + "\n")
+
+    with caplog.at_level(logging.WARNING):
+        applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/package.json"]
+    assert not any("ningún lockfile hermano" in r.message for r in caplog.records)

@@ -165,6 +165,16 @@ Todos los tests deben ejecutar y pasar con `npx vitest run`.
 4. **Comando del proyecto**: `FLEET_VALIDATE_CMD`, o `bin/fleet-validate`, o `make validate`.
    Aquí el proyecto corre **sus** tests con su toolchain.
 
+> **Subproyectos con su propio package.json (requerimiento 18).** Si el 100% de los
+> archivos del ticket cae bajo un único subdirectorio que tiene su propio
+> `package.json` (ej. `mobile/` en un monorepo Next.js + Expo), pasos 2 y 3 corren
+> con `cwd` en ESE subdirectorio en vez de la raíz — el `tsconfig`/`package.json` de
+> la raíz no incluye ese código, así que correr ahí daba "✓ validado" sin cobertura
+> real. `_find_subproject_root` detecta el caso; el reporte lo marca explícitamente
+> ("SUBPROYECTO DETECTADO"). El baseline de fallos preexistentes de Vitest (paso 3,
+> requerimiento 10) se calcula siempre en la raíz — no es comparable contra la suite
+> del subproyecto, así que ahí se cae a modo estricto (cualquier fallo bloquea).
+
 > **bin/fleet-validate (v3).** Cada proyecto debe tener `bin/fleet-validate` — un script
 > ejecutable que corre TypeScript + Vitest + cualquier otro check del proyecto.
 > La Flota lo llama automáticamente si existe.
@@ -313,10 +323,3 @@ curl -s -X POST http://localhost:8000/solve \
 - **Métrica "first-pass test rate"**: cuántos tickets pasan el gate de vitest en el primer ciclo.
 - **Persistencia de cadena de fallos** por ticket para evitar errores repetidos entre ciclos.
 - **Test coverage report**: integrar istanbul/nyc y fallar si coverage baja del umbral.
-- **Requerimiento 18, prioridad media, pendiente**: señal de alerta en el log cuando
-  `package.json` cambia versiones pero el lockfile correspondiente no tiene diff (fuerte
-  indicio de que no hubo instalación real); `validation_gate` debería detectar tickets
-  100% dentro de un subdirectorio con su propio `package.json`/`tsconfig.json` (ej.
-  `mobile/`) y correr el `tsc`/test runner de ESE manifest en vez de (o además de) el
-  del proyecto raíz — hoy un ticket 100% `mobile/` puede pasar "✓ validado" sin ninguna
-  cobertura real sobre ese código.
