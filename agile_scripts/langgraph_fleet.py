@@ -649,6 +649,45 @@ def _mentioned_file_paths(criteria: str) -> set:
     return set(_re.findall(_FILE_PATH_RE, criteria))
 
 
+# Requerimiento 22: frases que declaran cuál es el archivo NUEVO/objetivo del
+# ticket ("SOLO crear el archivo nuevo X", "crear el archivo nuevo X"). Ese
+# path nunca debe terminar en la lista de prohibidos, aunque el mismo párrafo
+# de alcance también liste archivos existentes a NO tocar en la misma oración
+# — caso real: "Alcance: SOLO crear el archivo nuevo
+# `.github/workflows/mobile-tests.yml`. No modificar `quick-checks.yml`,
+# `test-battery.yml`..." donde el path del archivo a crear cae dentro de la
+# ventana de texto de una frase "no modificar" cercana y termina capturado
+# como prohibido — exactamente el archivo que el ticket pedía crear.
+_NEW_FILE_TARGET_MARKERS = (
+    "crear el archivo nuevo", "crear un archivo nuevo",
+    "crear el nuevo archivo", "crear un nuevo archivo",
+)
+
+
+def _find_declared_creation_targets(criteria: str) -> set:
+    """Rutas que el requerimiento declara explícitamente como "el archivo
+    nuevo a crear" (requerimiento 22). Se usan para excluirlas de la lista de
+    prohibidos que arma `_find_explicitly_forbidden_files`, sin importar si
+    el regex de esa función las capturó por estar dentro de la ventana de
+    texto de una frase "no modifiques/no toques" cercana."""
+    if not criteria:
+        return set()
+    targets = set()
+    lower = criteria.lower()
+    for marker in _NEW_FILE_TARGET_MARKERS:
+        start = 0
+        while True:
+            idx = lower.find(marker, start)
+            if idx == -1:
+                break
+            window = criteria[idx: idx + 160]
+            path_match = _re.search(_FILE_PATH_RE, window)
+            if path_match:
+                targets.add(path_match.group(0))
+            start = idx + len(marker)
+    return targets
+
+
 def _find_explicitly_forbidden_files(criteria: str) -> set:
     """Rutas que el requerimiento prohíbe tocar por nombre (requerimiento 15,
     criterio 1). Busca cada frase de prohibición (_FORBID_MARKERS) y captura
@@ -661,7 +700,13 @@ def _find_explicitly_forbidden_files(criteria: str) -> set:
     de", "excepto", "salvo", "que no sea", "distinto de"), la frase es un
     allow-list ("no toques nada FUERA DE X" = "solo puedes tocar X") y no un
     deny-list — ese path NO se agrega a `forbidden` (es, de hecho, uno de los
-    archivos que sí se espera que se toquen)."""
+    archivos que sí se espera que se toquen).
+
+    Requerimiento 22: cualquier path declarado como "el archivo nuevo a
+    crear" (`_find_declared_creation_targets`) se excluye siempre del
+    resultado, aunque el path haya caído dentro de la ventana de una frase de
+    prohibición vecina en el mismo párrafo — el objetivo real del ticket
+    tiene prioridad sobre un match genérico de patrón/directorio."""
     if not criteria:
         return set()
     forbidden = set()
@@ -681,7 +726,7 @@ def _find_explicitly_forbidden_files(criteria: str) -> set:
                 if not any(inv in text_before_path for inv in _SCOPE_INVERSION_MARKERS):
                     forbidden.add(path_match.group(0))
             start = idx + len(marker)
-    return forbidden
+    return forbidden - _find_declared_creation_targets(criteria)
 
 
 def _is_out_of_scope(rel_path: str, mentioned_paths: set) -> bool:
