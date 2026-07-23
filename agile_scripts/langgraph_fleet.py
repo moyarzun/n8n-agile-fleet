@@ -1699,6 +1699,35 @@ def _git_original_content(workspace: str, rel_path: str) -> Optional[str]:
     return out if rc == 0 else None
 
 
+def _no_effective_changes(workspace: str, applied_files: list, existing_files: dict) -> bool:
+    """Requerimiento 20: True si TODOS los archivos "aplicados" en este ciclo
+    son byte-idénticos a su contenido previo (`existing_files`) — el
+    generador escribió los archivos pero no cambió nada en la práctica.
+
+    Un archivo nuevo (no estaba en `existing_files`) o uno eliminado siempre
+    cuenta como cambio real. Si algún archivo aplicado no se puede comparar
+    (no está en disco por otra razón, o falla la lectura), se asume
+    conservadoramente que SÍ hay cambio — esta guarda solo debe activarse
+    cuando la ausencia de cambio es inequívoca."""
+    if not applied_files:
+        return False
+    for rel in applied_files:
+        full = os.path.join(workspace, rel)
+        old_content = existing_files.get(rel)
+        if old_content is None:
+            return False  # archivo nuevo del ticket -> hay cambio
+        if not os.path.isfile(full):
+            return False
+        try:
+            with open(full, errors="replace") as fh:
+                new_content = fh.read()
+        except Exception:
+            return False
+        if new_content != old_content:
+            return False
+    return True
+
+
 # ===========================================================================
 # 4. Nodos del grafo
 # ===========================================================================
@@ -2338,6 +2367,31 @@ def validation_gate_node(state: FleetState) -> dict:
         return {"validation_passed": False,
                 "validation_report": "No se generó ningún archivo.",
                 "messages": [AIMessage(content="Validación: sin archivos", name="Validator")]}
+
+    # Requerimiento 20: un ciclo cuyos archivos "aplicados" son todos
+    # byte-idénticos a su contenido previo no hizo ningún cambio real — caso
+    # real observado: un ticket pedía que la Flota ejecutara un `git merge`
+    # con resolución de conflicto (operación que el pipeline actual no sabe
+    # ejecutar; el dynamic_developer solo escribe diffs de archivos). El LLM
+    # devolvió el archivo tal cual estaba, los mismos tests que ya pasaban
+    # siguieron pasando, y el ciclo terminaba reportado como
+    # "✅ Aprobado+validado" sin ningún commit real (rama idéntica a la base,
+    # sin PR). Sin diff efectivo, no hay nada que aprobar.
+    existing_files = state.get("existing_files", {})
+    if _no_effective_changes(workspace, applied_files, existing_files):
+        _log("[validation_gate] Ciclo sin cambios efectivos (archivos idénticos al original).")
+        return {
+            "validation_passed": False,
+            "validation_report": (
+                "Sin cambios producidos: todos los archivos aplicados son idénticos "
+                "a su contenido original — no se realizó ningún cambio real. Si el "
+                "requerimiento pide una operación de Git (merge/rebase/cherry-pick) "
+                "más allá de editar archivos de código, ese flujo no está soportado "
+                "por este pipeline; debe resolverse manualmente o reformularse como "
+                "una edición de archivo explícita."
+            ),
+            "messages": [AIMessage(content="Validación: sin cambios efectivos", name="Validator")],
+        }
 
     # Si regression_guard ya detectó regresiones, no correr tsc — el reporte ya está listo
     regression_errors = state.get("regression_errors", [])
