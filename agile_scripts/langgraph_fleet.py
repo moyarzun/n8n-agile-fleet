@@ -1618,7 +1618,45 @@ def _check_prisma_regression(old: str, new: str) -> List[str]:
     return issues
 
 
-def _check_ts_exports_regression(old: str, new: str) -> List[str]:
+# Requerimiento 21: verbos que, junto con el nombre exacto de una función/
+# export entre backticks, declaran una eliminación INTENCIONAL pedida por el
+# propio ticket ("eliminar `markAttendanceForClass`", "borrar `X` y su helper
+# `Y`"). Sin esto, el guard de regresión de exports no distingue "el ticket
+# pidió borrar X" de "el generador corrompió el archivo y perdió X sin
+# querer" — y revertía la eliminación pedida en cada ciclo, sin poder
+# converger nunca (caso real: TASK-d11c44eb, 6 ciclos agotados).
+_INTENTIONAL_REMOVAL_MARKERS = (
+    "eliminar", "elimina", "eliminá", "borrar", "borra", "borrá",
+    "remove", "delete",
+)
+
+
+def _find_intentionally_removed_exports(criteria: str) -> set:
+    """Nombres de función/export que el requerimiento pide eliminar
+    explícitamente por nombre (requerimiento 21). Solo captura identificadores
+    entre backticks cercanos a un verbo de eliminación (`_INTENTIONAL_REMOVAL_
+    MARKERS`) — igual que el resto de las guardas de esta sección, que asumen
+    que el requerimiento cita nombres de archivo/función entre backticks. Un
+    export que coincide exactamente con uno de estos nombres no cuenta como
+    regresión en `_check_ts_exports_regression`; cualquier otro export perdido
+    sigue rechazándose normalmente."""
+    if not criteria:
+        return set()
+    names = set()
+    lower = criteria.lower()
+    for marker in _INTENTIONAL_REMOVAL_MARKERS:
+        start = 0
+        while True:
+            idx = lower.find(marker, start)
+            if idx == -1:
+                break
+            window = criteria[idx: idx + 200]
+            names.update(_re.findall(r"`(\w+)`", window))
+            start = idx + len(marker)
+    return names
+
+
+def _check_ts_exports_regression(old: str, new: str, criteria: str = "") -> List[str]:
     """Detecta exports de TypeScript/JS eliminados en la versión generada.
 
     Cubre `export [async] function/class/const/type/interface/enum NOMBRE` — lo
@@ -1626,11 +1664,16 @@ def _check_ts_exports_regression(old: str, new: str) -> List[str]:
     PUT/DELETE/PATCH`) en archivos route.ts. Ver requerimiento 16: un ciclo
     reescribió un route.ts bajo ALLOW_REWRITE y perdió el handler GET; esta
     comparación lo marca como regresión — ALLOW_REWRITE autoriza reescribir el
-    contenido, NO perder capacidades públicas del archivo."""
+    contenido, NO perder capacidades públicas del archivo.
+
+    Requerimiento 21: los exports que el propio `criteria` pide eliminar por
+    nombre (`_find_intentionally_removed_exports`) se excluyen del cómputo de
+    "removidos" — su desaparición es el resultado pedido, no una regresión.
+    Si además desaparece algo NO pedido, eso sigue reportándose."""
     pat = r'^export\s+(?:async\s+)?(?:function|class|const|type|interface|enum)\s+(\w+)'
     old_exports = set(_re.findall(pat, old, _re.MULTILINE))
     new_exports = set(_re.findall(pat, new, _re.MULTILINE))
-    removed = old_exports - new_exports
+    removed = old_exports - new_exports - _find_intentionally_removed_exports(criteria)
     if removed:
         _HTTP_HANDLERS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
         http_lost = sorted(removed & _HTTP_HANDLERS)
@@ -2001,6 +2044,7 @@ def regression_guard_node(state: FleetState) -> dict:
     workspace      = state["workspace_path"]
     existing_files = dict(state.get("existing_files", {}))
     applied_files  = set(state.get("applied_files", []))
+    criteria       = state.get("acceptance_criteria", "")
 
     # Requerimiento 16: augmentar existing_files con el 'antes' desde git para
     # cualquier archivo aplicado que codebase_reader no capturó (rutas
@@ -2039,7 +2083,7 @@ def regression_guard_node(state: FleetState) -> dict:
                 file_issues.extend(_check_prisma_regression(old_content, new_content))
             elif rel.endswith((".ts", ".tsx", ".js")):
                 file_issues.extend(
-                    f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content)
+                    f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content, criteria)
                 )
 
         if file_issues:
