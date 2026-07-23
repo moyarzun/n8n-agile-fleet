@@ -47,8 +47,9 @@ services:
       - FLEET_CHECKPOINT_DB=/data/n8n_store/checkpoints.db
       # Reanudación automática de jobs interrumpidos al arrancar (Req 2)
       - FLEET_AUTO_RESUME=${FLEET_AUTO_RESUME:-false}
-      # Trazas OTel → Jaeger; vacío = tracing deshabilitado (Req 6)
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      # Trazas OTel → OpenTelemetry Collector (deriva métricas RED para el
+      # tab Monitor de Jaeger y reenvía las trazas). Vacío = tracing off (Req 6).
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
       # Comando de validación determinista del proyecto (corre la suite real).
       - FLEET_VALIDATE_CMD=${FLEET_VALIDATE_CMD:-}
       - FLEET_VALIDATE_TIMEOUT=${FLEET_VALIDATE_TIMEOUT:-600}
@@ -71,15 +72,67 @@ services:
       retries: 3
       start_period: 10s
 
-  # Backend + UI de trazas OTel (spec langgraph-hardening, Req 6.5)
+  # Backend + UI de trazas OTel (spec langgraph-hardening, Req 6.5).
+  # Con SPM habilitado: lee métricas RED desde Prometheus para el tab Monitor.
   jaeger:
     image: jaegertracing/all-in-one:latest
     container_name: fleet-jaeger
     restart: unless-stopped
-    ports:
-      - "16686:16686"   # UI
+    # La UI se publica vía jaeger-proxy (inyecta el fix de dark mode); Jaeger
+    # queda solo en la red interna, accesible como jaeger:16686.
+    expose:
+      - "16686"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+      # Service Performance Monitoring (SPM): fuente de métricas = Prometheus.
+      - METRICS_STORAGE_TYPE=prometheus
+      - PROMETHEUS_SERVER_URL=http://prometheus:9090
+      # El conector span_metrics prefija las métricas con este namespace
+      # (traces_span_metrics_calls_total, ..._duration_milliseconds_bucket).
+      - PROMETHEUS_QUERY_NAMESPACE=traces_span_metrics
+      # Normaliza nombres/labels a los que emite el exporter Prometheus del collector.
+      - PROMETHEUS_QUERY_NORMALIZE_CALLS=true
+      - PROMETHEUS_QUERY_NORMALIZE_DURATION=true
+    depends_on:
+      - prometheus
+
+  # Proxy que sirve la UI de Jaeger inyectando el fix del modo oscuro.
+  jaeger-proxy:
+    image: nginx:alpine
+    container_name: fleet-jaeger-proxy
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # UI de Jaeger (con dark mode corregido)
+    volumes:
+      - ./observability/jaeger-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./observability/jaeger-dark-fix.css:/etc/nginx/claude-dark-fix.css:ro
+    depends_on:
+      - jaeger
+
+  # Collector: deriva métricas RED (spanmetrics) desde las trazas y reenvía
+  # las trazas a Jaeger. Ver observability/otel-collector-config.yaml.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: fleet-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  # Almacena las métricas RED que produce el collector; Jaeger las consulta (SPM).
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fleet-prometheus
+    restart: unless-stopped
+    ports:
+      # 9091 en el host (9090 lo ocupa Calibre); Jaeger igual lo alcanza en la
+      # red interna vía prometheus:9090.
+      - "9091:9090"   # UI/API de Prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
 
   mcp-fleet-server:
     build: .
@@ -99,3 +152,4 @@ services:
 
 volumes:
   n8n_data:
+  prometheus_data:

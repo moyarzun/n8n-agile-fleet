@@ -55,15 +55,27 @@ def set_tracer_for_tests(tracer) -> None:
     _tracer = tracer
 
 
-def _span(name: str, attributes: dict):
+def _span(name: str, attributes: dict, kind=None):
     if _tracer is None:
         return nullcontext()
-    return _tracer.start_as_current_span(name, attributes=attributes)
+    if kind is None:
+        return _tracer.start_as_current_span(name, attributes=attributes)
+    return _tracer.start_as_current_span(name, attributes=attributes, kind=kind)
 
 
 def job_span(job_id: str, ticket_id: str):
-    """Span raíz de un job (uno por ejecución del FleetEngine)."""
-    return _span("fleet.job", {"fleet.job_id": job_id, "fleet.ticket_id": ticket_id})
+    """Span raíz de un job (uno por ejecución del FleetEngine).
+
+    Marcado como SERVER (no INTERNAL) para que el tab Monitor (SPM) de Jaeger
+    —que filtra por SPAN_KIND_SERVER por defecto— muestre la actividad de la
+    flota (throughput, tasa de error y latencia por job) sin cambiar el filtro.
+    Los spans hijos node.* y llm.* siguen siendo INTERNAL."""
+    server_kind = trace.SpanKind.SERVER if _OTEL_AVAILABLE else None
+    return _span(
+        "fleet.job",
+        {"fleet.job_id": job_id, "fleet.ticket_id": ticket_id},
+        kind=server_kind,
+    )
 
 
 def node_span(node_name: str):

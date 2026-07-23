@@ -145,19 +145,23 @@ def _make_or(model: str, temperature: float, timeout: int = 900) -> ChatOpenAI:
         },
     )
 
+
+# 2026-07-20: "qwen/qwen3-coder:free" y "meta-llama/llama-3.3-70b-instruct:free"
+# fueron dados de baja por OpenRouter (404 NotFoundError constante, ~55% de los
+# errores de la flota en 24h). Reemplazados por modelos free vigentes con
+# perfil similar (coder-agent / general-instruct). Verificar catálogo vivo con
+# GET https://openrouter.ai/api/v1/models antes de reintroducir un slug caído.
 _OR_DEV_CHAIN = [
     _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.3),
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.3),
-    _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.3),
+    _make_or("cohere/north-mini-code:free", 0.3),
+    _make_or("poolside/laguna-m.1:free", 0.3),
 ]
-
-# Para desarrollo: Qwen 3 Coder como modelo primario (mejor seguimiento de formato FILE_BEGIN/END)
-_qwen_dev = _make_or("qwen/qwen3-coder:free", 0.3)
 
 _OR_REVIEWER_CHAIN = [
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.0),
     _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.0),
-    _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.0),
+    _make_or("google/gemma-4-31b-it:free", 0.0),
 ]
 
 
@@ -257,6 +261,21 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 - No cambies next.config.mjs ni tsconfig.json sin necesidad.
 - Los Server Components no pueden tener 'use client' ni usar hooks de React.
 - Los Client Components deben tener 'use client' al inicio si usan useState/useEffect/hooks.
+
+[NO ALUCINES INSTALACIONES DE PAQUETES — limitación conocida, requerimiento 18]
+- No tenés forma de ejecutar `npm install`, `npx expo install --check`, ni ningún
+  comando de instalación real — no hay terminal ni proceso disponible desde acá.
+  Si el requerimiento pide "correr" uno de esos comandos, NO inventes cuál sería
+  el resultado del árbol de dependencias.
+- Para agregar una dependencia a package.json: edita SOLO agregando la(s)
+  línea(s) de dependencies/devDependencies pedida(s) por nombre, con la versión
+  que indique el requerimiento (o la última conocida si no la especifica). NO
+  toques la versión de ninguna OTRA dependencia ya presente, NO elimines
+  ninguna, NO cambies el campo "name" del paquete.
+- Un package.json con cualquier dependencia preexistente cambiada de versión o
+  eliminada sin que el requerimiento la mencione por nombre explícitamente se
+  rechaza automáticamente entero (guarda de dependencias) — se pierde el ciclo
+  completo si esto pasa.
 """.strip()
 
 ENGINEERING_GUARDRAILS_GENERIC = """
@@ -264,6 +283,11 @@ REGLAS DE INGENIERÍA NO NEGOCIABLES (incumplirlas = rechazo automático):
 - Escribe código completo y funcional. Sin placeholders ('...', 'TODO', 'rest of implementation').
 - Respeta el stack y lenguaje del proyecto existente. No introduzcas lenguajes ajenos.
 - Lee los archivos existentes antes de escribir para no romper interfaces ya definidas.
+- No tenés forma de ejecutar comandos de instalación de paquetes reales (npm install,
+  bundle install, pip install, etc.) — si el requerimiento pide "correr" uno de esos
+  comandos, no inventes su resultado. Editá el manifest de dependencias (package.json,
+  Gemfile, requirements.txt...) agregando SOLO lo pedido por nombre, sin tocar ni
+  eliminar ninguna entrada preexistente no mencionada.
 """.strip()
 
 def _get_guardrails(stack: str) -> str:
@@ -373,9 +397,13 @@ def _invoke_chain(primary, fallback_chain: list, messages: list) -> object:
 
 
 def _invoke_dev(messages: list) -> object:
-    # Orden: Qwen Coder → Nemotron Ultra → Nemotron Super → Llama → MiniMax (último recurso)
-    # MiniMax va al final: responde rápido pero no sigue el formato FILE_BEGIN/END
-    return _invoke_chain(_qwen_dev, _OR_DEV_CHAIN + [_minimax_dev], messages)
+    # MiniMax primero en todos los roles (2026-07-20): la cadena free previa
+    # (Qwen Coder → Nemotron × 2 → Llama) causaba ~55% NotFoundError (slugs
+    # dados de baja por OpenRouter) + rate-limit diario compartido entre
+    # modelos free, agregando latencia y errores en cada ciclo del dev. Si
+    # MiniMax no sigue el formato FILE_BEGIN/END en la práctica, revisar
+    # trazas — se mantiene la cadena free como fallback real.
+    return _invoke_chain(_minimax_dev, _OR_DEV_CHAIN, messages)
 
 
 def _invoke_reviewer(messages: list) -> object:
@@ -564,18 +592,54 @@ def _find_implicitly_protected_impl_files(criteria: str) -> Dict[str, str]:
 # Extensión de ruta de archivo de código/config que reconocemos al parsear
 # rutas dentro del texto del requerimiento (mismo set que codebase_reader).
 # Los corchetes `[]` permiten capturar rutas dinámicas de Next.js
-# (`[param]`) — ver requerimiento 16.
-_FILE_PATH_RE = r"[\w/\-\.\[\]]+\.(?:ts|tsx|js|jsx|prisma|sql|rb|py|go|rs|json|yaml|yml|md|sh|css|scss|html|vue)"
+# (`[param]`) — ver requerimiento 16. Los paréntesis `()` permiten capturar
+# "route groups" de Next.js App Router / Expo Router (`(tabs)`, `(marketing)`,
+# `(dashboard)`) — ver requerimiento 19: sin ellos, `mobile/app/(tabs)/index.tsx`
+# se cortaba en el paréntesis y la guarda de alcance nunca reconocía el path
+# real, rechazando el único archivo mencionado en el ticket.
+#
+# Orden de la alternación de extensiones: las MÁS LARGAS van antes que
+# cualquier prefijo suyo (tsx antes de ts, jsx/json antes de js) — descubierto
+# escribiendo los tests de regresión del requerimiento 19. La alternación de
+# regex prueba las opciones en orden y se queda con la PRIMERA que matchea,
+# no la más larga: con el orden viejo (ts antes que tsx), al hacer backtrack
+# sobre `[...]+\.` el motor encontraba el único punto disponible (el de
+# ".tsx") y ahí "ts" matcheaba antes que "tsx" pudiera intentarse, dejando la
+# "x" final afuera del match. Bug real y con impacto amplio: CUALQUIER
+# mención de un archivo `.tsx`/`.jsx` en el texto de un requerimiento se
+# reconocía truncada a `.ts`/`.js` — y "package.json" se truncaba a
+# "package.js" (mismo problema, "js" antes que "json").
+_FILE_PATH_RE = r"[\w/\-\.\[\]\(\)]+\.(?:tsx|ts|jsx|json|js|prisma|sql|rb|py|go|rs|yaml|yml|md|sh|css|scss|html|vue)"
 
 # Requerimiento 15: frases de prohibición explícita por nombre de archivo. El
 # req 11 solo cubría el caso "companion no mencionado"; acá se cubre el caso
 # opuesto y más fuerte — el requerimiento nombra el archivo y dice que NO se
 # toque. Ese archivo debe ser hard-reject si el agente lo modifica igual.
+#
+# Requerimiento 17: "no reescribas"/"no reescribir" se sacaron de esta lista.
+# A diferencia de "no modifiques"/"no toques" (que esperan CERO cambios en el
+# archivo), "no reescribas X, solo agrega/cambia Y" autoriza una edición
+# acotada — por definición espera algún cambio. Bloquearlo por nombre como
+# hard-reject impedía la propia edición pequeña que la frase pedía (caso real:
+# TASK-ce8abf86/TASK-4bdedf6f). El riesgo real que "no reescribas" busca
+# prevenir — que el agente reescriba el archivo completo en vez de editarlo
+# puntualmente — ya lo cubren las guardas 1/2 de `_apply_workspace_changes`
+# (detección de reescritura >30% por tamaño/líneas), que sí distinguen una
+# edición chica de una reescritura completa.
 _FORBID_MARKERS = (
     "no modifiques", "no modificar", "no toques", "no tocar", "no edites",
-    "no editar", "no cambies", "no cambiar", "no reescribas", "no reescribir",
+    "no editar", "no cambies", "no cambiar",
     "no alteres", "no alterar", "sin tocar", "sin modificar", "no modifica",
 )
+
+# Requerimiento 17, criterio 1: calificadores que INVIERTEN el sentido de la
+# prohibición cuando aparecen entre el verbo prohibitivo y el path — "no
+# toques ningún archivo FUERA DE X" es un allow-list (permite SOLO X),
+# exactamente lo opuesto de "no toques X". Si alguno de estos aparece antes
+# del path capturado, esa coincidencia se descarta — el path NO se agrega a
+# la lista de prohibidos (queda cubierto, correctamente, por `_is_out_of_scope`
+# vía `_mentioned_file_paths`, que sí entiende el caso allow-list).
+_SCOPE_INVERSION_MARKERS = ("fuera de", "excepto", "salvo", "que no sea", "distinto de")
 
 
 def _mentioned_file_paths(criteria: str) -> set:
@@ -585,12 +649,64 @@ def _mentioned_file_paths(criteria: str) -> set:
     return set(_re.findall(_FILE_PATH_RE, criteria))
 
 
+# Requerimiento 22: frases que declaran cuál es el archivo NUEVO/objetivo del
+# ticket ("SOLO crear el archivo nuevo X", "crear el archivo nuevo X"). Ese
+# path nunca debe terminar en la lista de prohibidos, aunque el mismo párrafo
+# de alcance también liste archivos existentes a NO tocar en la misma oración
+# — caso real: "Alcance: SOLO crear el archivo nuevo
+# `.github/workflows/mobile-tests.yml`. No modificar `quick-checks.yml`,
+# `test-battery.yml`..." donde el path del archivo a crear cae dentro de la
+# ventana de texto de una frase "no modificar" cercana y termina capturado
+# como prohibido — exactamente el archivo que el ticket pedía crear.
+_NEW_FILE_TARGET_MARKERS = (
+    "crear el archivo nuevo", "crear un archivo nuevo",
+    "crear el nuevo archivo", "crear un nuevo archivo",
+)
+
+
+def _find_declared_creation_targets(criteria: str) -> set:
+    """Rutas que el requerimiento declara explícitamente como "el archivo
+    nuevo a crear" (requerimiento 22). Se usan para excluirlas de la lista de
+    prohibidos que arma `_find_explicitly_forbidden_files`, sin importar si
+    el regex de esa función las capturó por estar dentro de la ventana de
+    texto de una frase "no modifiques/no toques" cercana."""
+    if not criteria:
+        return set()
+    targets = set()
+    lower = criteria.lower()
+    for marker in _NEW_FILE_TARGET_MARKERS:
+        start = 0
+        while True:
+            idx = lower.find(marker, start)
+            if idx == -1:
+                break
+            window = criteria[idx: idx + 160]
+            path_match = _re.search(_FILE_PATH_RE, window)
+            if path_match:
+                targets.add(path_match.group(0))
+            start = idx + len(marker)
+    return targets
+
+
 def _find_explicitly_forbidden_files(criteria: str) -> set:
     """Rutas que el requerimiento prohíbe tocar por nombre (requerimiento 15,
     criterio 1). Busca cada frase de prohibición (_FORBID_MARKERS) y captura
     la primera ruta de archivo que aparezca en una ventana de texto posterior
     (misma oración/instrucción). Devuelve el set de rutas prohibidas —
-    hard-reject si el agente las modifica igual."""
+    hard-reject si el agente las modifica igual.
+
+    Requerimiento 17: si entre el verbo prohibitivo y el path aparece un
+    calificador de inversión de alcance (_SCOPE_INVERSION_MARKERS — "fuera
+    de", "excepto", "salvo", "que no sea", "distinto de"), la frase es un
+    allow-list ("no toques nada FUERA DE X" = "solo puedes tocar X") y no un
+    deny-list — ese path NO se agrega a `forbidden` (es, de hecho, uno de los
+    archivos que sí se espera que se toquen).
+
+    Requerimiento 22: cualquier path declarado como "el archivo nuevo a
+    crear" (`_find_declared_creation_targets`) se excluye siempre del
+    resultado, aunque el path haya caído dentro de la ventana de una frase de
+    prohibición vecina en el mismo párrafo — el objetivo real del ticket
+    tiene prioridad sobre un match genérico de patrón/directorio."""
     if not criteria:
         return set()
     forbidden = set()
@@ -604,11 +720,13 @@ def _find_explicitly_forbidden_files(criteria: str) -> set:
             # Ventana desde el marcador: el path prohibido aparece justo después
             # ("no modifiques `src/server/auth/context.ts` en este ticket...").
             window = criteria[idx: idx + 160]
-            paths = _re.findall(_FILE_PATH_RE, window)
-            if paths:
-                forbidden.add(paths[0])
+            path_match = _re.search(_FILE_PATH_RE, window)
+            if path_match:
+                text_before_path = window[:path_match.start()].lower()
+                if not any(inv in text_before_path for inv in _SCOPE_INVERSION_MARKERS):
+                    forbidden.add(path_match.group(0))
             start = idx + len(marker)
-    return forbidden
+    return forbidden - _find_declared_creation_targets(criteria)
 
 
 def _is_out_of_scope(rel_path: str, mentioned_paths: set) -> bool:
@@ -645,6 +763,90 @@ def _find_allow_rewrite_files(criteria: str) -> set:
     return {m.strip() for m in _re.findall(r"ALLOW_REWRITE:\s*([^\n\r]+)", criteria)}
 
 
+_PACKAGE_JSON_DEPENDENCY_FIELDS = (
+    "dependencies", "devDependencies", "peerDependencies", "optionalDependencies",
+)
+
+
+def _find_unauthorized_package_json_dependency_changes(
+    original_content: str, new_content: str, criteria: str,
+) -> list:
+    """Requerimiento 18: `dynamic_developer` no ejecuta `npm`/`npx` de verdad
+    — cuando el requerimiento pide "correr" una instalación, el LLM alucina
+    el `package.json` resultante en vez de aplicar el cambio puntual pedido
+    (caso real: TASK-2cd6964f, downgrades de 2 versiones mayores y 7 paquetes
+    eliminados sin pedirlo, con el lockfile completamente desincronizado).
+
+    Compara `dependencies`/`devDependencies`/`peerDependencies`/
+    `optionalDependencies` del `package.json` propuesto contra el original,
+    campo por campo. Cualquier dependencia PREEXISTENTE cuya versión cambió o
+    que fue eliminada es una violación — a menos que el requerimiento
+    mencione ese paquete por nombre explícitamente en su texto (autorización
+    real de tocarlo). Devuelve la lista de violaciones (vacía = sin
+    problemas); no valida altas nuevas de paquetes (agregar una dependencia
+    nueva es exactamente lo que suelen pedir estos tickets).
+
+    Si alguno de los dos contenidos no es JSON válido, no opina — eso ya lo
+    maneja el resto del pipeline (o el propio `npm install` al fallar)."""
+    try:
+        original = _json.loads(original_content)
+        new = _json.loads(new_content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(original, dict) or not isinstance(new, dict):
+        return []
+
+    # Tokens exactos del texto del requerimiento, no substring: un simple "in"
+    # haría que "react" cuente como "mencionado" solo por aparecer dentro de
+    # "react-native"/"react-test-renderer" — falso negativo que dejaría pasar
+    # justo el caso motivador de este requerimiento. `[@\w][\w./-]*` conserva
+    # los caracteres válidos de un nombre de paquete npm (@scope/nombre-con-guiones).
+    mentioned_tokens = {t.lower() for t in _re.findall(r"[@\w][\w./-]*", criteria or "")}
+    violations = []
+    for field in _PACKAGE_JSON_DEPENDENCY_FIELDS:
+        orig_deps = original.get(field)
+        new_deps = new.get(field)
+        if not isinstance(orig_deps, dict):
+            continue
+        new_deps = new_deps if isinstance(new_deps, dict) else {}
+        for name, orig_version in orig_deps.items():
+            if name.lower() in mentioned_tokens:
+                continue  # mencionado explícitamente por nombre -> autorizado
+            if name not in new_deps:
+                violations.append(f"{field}.{name}: eliminado (versión original {orig_version})")
+            elif new_deps[name] != orig_version:
+                violations.append(
+                    f"{field}.{name}: versión cambiada de {orig_version} a {new_deps[name]}"
+                )
+    return violations
+
+
+_LOCKFILE_NAMES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml")
+
+
+def _package_json_dependencies_changed(original_content: str, new_content: str) -> bool:
+    """Requerimiento 18, punto 3: True si `dependencies`/`devDependencies`/
+    `peerDependencies`/`optionalDependencies` difieren en algo (alta, baja o
+    cambio de versión) entre el `package.json` original y el propuesto —
+    incluye altas nuevas autorizadas, a diferencia de
+    `_find_unauthorized_package_json_dependency_changes` (que solo mira
+    cambios NO autorizados). Se usa para decidir si vale la pena buscar un
+    lockfile hermano en la misma respuesta del LLM."""
+    try:
+        original = _json.loads(original_content)
+        new = _json.loads(new_content)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(original, dict) or not isinstance(new, dict):
+        return False
+    for field in _PACKAGE_JSON_DEPENDENCY_FIELDS:
+        orig_deps = original.get(field) if isinstance(original.get(field), dict) else {}
+        new_deps = new.get(field) if isinstance(new.get(field), dict) else {}
+        if orig_deps != new_deps:
+            return True
+    return False
+
+
 def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = "") -> tuple:
     """Extrae bloques ===FILE_BEGIN/END=== de la respuesta del LLM y los escribe al disco.
 
@@ -676,12 +878,18 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
        companion de un test mencionado) — hard-reject para evitar regresiones
        en código compartido no pedido (requerimiento 15, criterio 2). Solo
        aplica si el requerimiento menciona al menos una ruta.
+    7. Es un `package.json` existente y el contenido propuesto cambia la
+       versión o elimina una dependencia PREEXISTENTE que el requerimiento no
+       mencionó por nombre — señal de que el LLM alucinó el árbol de
+       dependencias en vez de ejecutar `npm`/`npx` de verdad, que no tiene
+       forma de hacer (requerimiento 18). Agregar una dependencia nueva no se
+       bloquea; solo cambios/bajas de las que ya estaban.
 
     Las guardas 1 y 2 (basadas en tamaño) se desactivan por archivo con la
     marca `ALLOW_REWRITE: <ruta>` en `criteria` (requerimiento 13): opt-out
     explícito para simplificaciones masivas intencionales, sin afectar a los
     demás archivos del ciclo. `ALLOW_REWRITE` NO desactiva las guardas de
-    alcance (5 y 6) — son de otra naturaleza.
+    alcance ni de contenido (5, 6 y 7) — son de otra naturaleza.
     """
     applied = []
     rejected = []
@@ -740,6 +948,35 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
             rejected.append(reason)
             logger.warning("Archivo %s rechazado: fuera del árbol de directorios del ticket", full_path)
             continue
+
+        # Guarda de dependencias no autorizadas en package.json (requerimiento
+        # 18): `dynamic_developer` no ejecuta npm de verdad, así que un cambio
+        # de versión/eliminación de una dependencia PREEXISTENTE que el
+        # requerimiento no mencionó por nombre es señal de que el LLM alucinó
+        # el árbol de dependencias en vez de aplicar el cambio puntual pedido.
+        # No depende de ALLOW_REWRITE (es una guarda de contenido/alcance
+        # semántico, no de tamaño).
+        if os.path.basename(rel_path) == "package.json" and os.path.exists(full_path):
+            try:
+                with open(full_path, "r", errors="ignore") as fh:
+                    original_package_json = fh.read()
+            except OSError:
+                original_package_json = ""
+            dep_violations = _find_unauthorized_package_json_dependency_changes(
+                original_package_json, content, criteria,
+            )
+            if dep_violations:
+                reason = (
+                    f"{rel_path}: cambios de dependencias no autorizados por el "
+                    f"requerimiento — {'; '.join(dep_violations)} — rechazado por "
+                    f"guarda de dependencias de package.json"
+                )
+                rejected.append(reason)
+                logger.warning(
+                    "Archivo %s rechazado: %d cambio(s) de dependencia no autorizado(s) (%s)",
+                    full_path, len(dep_violations), "; ".join(dep_violations),
+                )
+                continue
 
         protection = protected_impl_files.get(rel_path)
         if protection == "hard":
@@ -823,6 +1060,39 @@ def _apply_workspace_changes(workspace: str, llm_response: str, criteria: str = 
                     continue
 
         candidates[rel_path] = content
+
+    # Requerimiento 18, punto 3: señal de alerta (no bloquea, solo log) cuando
+    # un package.json que sobrevivió a la guarda de dependencias no
+    # autorizadas SÍ cambió sus dependencias (alta/baja/versión autorizada),
+    # pero ningún lockfile hermano (package-lock.json/yarn.lock/pnpm-lock.yaml
+    # del mismo directorio) aparece en la misma respuesta del LLM — fuerte
+    # indicio de que ningún npm/yarn/pnpm install real corrió (dynamic_developer
+    # no tiene esa herramienta; ver requerimiento 18).
+    for rel_path, content in list(candidates.items()):
+        if os.path.basename(rel_path) != "package.json":
+            continue
+        full_path = os.path.join(workspace, rel_path)
+        if not os.path.exists(full_path):
+            continue  # package.json nuevo, sin "original" contra el cual comparar
+        try:
+            with open(full_path, "r", errors="ignore") as fh:
+                original_pkg = fh.read()
+        except OSError:
+            continue
+        if not _package_json_dependencies_changed(original_pkg, content):
+            continue
+        pkg_dir = os.path.dirname(rel_path)
+        lockfile_touched = any(
+            os.path.dirname(p) == pkg_dir and os.path.basename(p) in _LOCKFILE_NAMES
+            for p in candidates
+        )
+        if not lockfile_touched:
+            logger.warning(
+                "%s cambia dependencias pero ningún lockfile hermano (%s) aparece en "
+                "la misma respuesta del LLM — fuerte indicio de que ningún "
+                "npm/yarn/pnpm install real corrió (requerimiento 18, punto 3)",
+                full_path, "/".join(_LOCKFILE_NAMES),
+            )
 
     # Segunda pasada: chequeo cruzado Angular .ts/.html sobre lo que sobrevivió
     # a las guardas de arriba.
@@ -1003,6 +1273,34 @@ def _run_vitest_baseline(workspace: str, stack: str) -> Optional[set]:
     return _extract_failing_tests(out)
 
 
+def _find_subproject_root(applied_files: list, workspace: str) -> Optional[str]:
+    """Requerimiento 18, punto 4: si el 100% de los archivos aplicados del
+    ticket caen bajo un único subdirectorio de primer nivel que tiene su
+    propio package.json (ej. mobile/), ese subdirectorio es el "root" real
+    para tsc/vitest — el tsconfig/package.json de la raíz no lo incluye (caso
+    real: TASK-2cd6964f, 100% mobile/, pasó validation_gate con "✓" corriendo
+    tsc/vitest del proyecto Next.js raíz, que ni siquiera ve mobile/ — cero
+    cobertura real). Devuelve la ruta relativa del subproyecto, o None si no
+    aplica (algún archivo del ticket está en la raíz, o hay archivos en más
+    de un subdirectorio de primer nivel, o el subdirectorio no tiene su
+    propio package.json) — en ese caso el comportamiento es el de siempre:
+    tsc/vitest sobre la raíz del workspace."""
+    if not applied_files:
+        return None
+    top_dirs = set()
+    for f in applied_files:
+        parts = f.split("/", 1)
+        if len(parts) < 2:
+            return None  # archivo directamente en la raíz -> no es un subproyecto aislado
+        top_dirs.add(parts[0])
+    if len(top_dirs) != 1:
+        return None
+    subdir = next(iter(top_dirs))
+    if os.path.exists(os.path.join(workspace, subdir, "package.json")):
+        return subdir
+    return None
+
+
 def _validate_workspace(
     workspace: str, applied_files: list, stack: str = "generic",
     baseline_failing_tests: Optional[set] = None,
@@ -1019,6 +1317,21 @@ def _validate_workspace(
     report = []
     ran_any = False
     ok = True
+
+    # Requerimiento 18, punto 4: si el ticket es 100% un subproyecto con su
+    # propio package.json (ej. mobile/), tsc/vitest corren AHÍ en vez de en
+    # la raíz — la raíz no lo cubre. `subproject_prefix` normaliza las rutas
+    # de `applied_files` (que vienen relativas al workspace) a relativas del
+    # subproyecto, para que el filtrado de errores por archivo siga funcionando.
+    subproject = _find_subproject_root(applied_files, workspace) if stack == "node" else None
+    effective_root = os.path.join(workspace, subproject) if subproject else workspace
+    subproject_prefix = subproject + "/" if subproject else ""
+    if subproject:
+        report.append(
+            f"SUBPROYECTO DETECTADO: 100% de los archivos del ticket están bajo "
+            f"'{subproject}/', que tiene su propio package.json — TYPESCRIPT/VITEST "
+            f"corren ahí en vez de en la raíz del workspace (requerimiento 18)."
+        )
 
     # ── Nivel 1a: sintaxis Ruby (solo proyectos Rails) ─────────────────────
     rb_files = [f for f in applied_files if f.endswith(".rb")]
@@ -1045,18 +1358,25 @@ def _validate_workspace(
             rc, out = _run(
                 ["node", "--max-old-space-size=2048", "./node_modules/.bin/tsc",
                  "--noEmit", "--skipLibCheck", "--incremental", "false"],
-                cwd=workspace, timeout=180,
+                cwd=effective_root, timeout=180,
             )
+            tsc_label = f"tsc --noEmit, {subproject}/" if subproject else "tsc --noEmit"
             oom = "Last few GCs" in out or "heap out of memory" in out.lower() or "JavaScript heap" in out
             if oom:
                 # OOM no es fallo del código generado — avisar y continuar
-                report.append("TYPESCRIPT (tsc --noEmit): ⚠ OOM en el contenedor — check omitido")
+                report.append(f"TYPESCRIPT ({tsc_label}): ⚠ OOM en el contenedor — check omitido")
             elif rc == 0:
-                report.append("TYPESCRIPT (tsc --noEmit): ✓ sin errores de tipos")
+                report.append(f"TYPESCRIPT ({tsc_label}): ✓ sin errores de tipos")
             else:
                 # Filtrar errores en archivos que la flota NO generó (pre-existentes).
                 # Un error en un archivo ajeno no debe bloquear el trabajo de la flota.
-                applied_set = set(applied_files)
+                # Las rutas que reporta tsc son relativas a `effective_root`; si hay
+                # subproyecto, `applied_files` viene relativo al workspace (ej.
+                # "mobile/foo.ts") — hay que sacarle el prefijo para que coincida.
+                applied_set = {
+                    f[len(subproject_prefix):] if subproject_prefix and f.startswith(subproject_prefix) else f
+                    for f in applied_files
+                }
                 error_lines = out.strip().splitlines()
                 # Patrón: "ruta/archivo.ts(linea,col): error TSxxxx: ..."
                 fleet_errors = []
@@ -1077,27 +1397,34 @@ def _validate_workspace(
                             preexisting_errors.append(line)
 
                 # Errores de módulos mobile (react-native, expo) en archivos fleet son
-                # falsos positivos: el tsconfig web no ve esas deps. No bloquear.
+                # falsos positivos SOLO cuando tsc corrió sobre el tsconfig de la
+                # RAÍZ (que no ve esas deps). Si ya estamos corriendo tsc dentro del
+                # propio subproyecto mobile/ (su tsconfig SÍ resuelve esos módulos),
+                # un error ahí es real y no debe ignorarse.
                 _MOBILE_MODULES = (
                     "'react-native'", "'@expo/", "'expo-", "'react-native-",
                     "'@react-native", "@react-navigation",
                 )
-                real_fleet_errors = [
-                    l for l in fleet_errors
-                    if not any(m in l for m in _MOBILE_MODULES)
-                ]
-                env_mobile_errors = [
-                    l for l in fleet_errors if l not in real_fleet_errors
-                ]
+                if subproject:
+                    real_fleet_errors = fleet_errors
+                    env_mobile_errors = []
+                else:
+                    real_fleet_errors = [
+                        l for l in fleet_errors
+                        if not any(m in l for m in _MOBILE_MODULES)
+                    ]
+                    env_mobile_errors = [
+                        l for l in fleet_errors if l not in real_fleet_errors
+                    ]
 
                 if real_fleet_errors:
                     ok = False
                     tail = "\n".join(real_fleet_errors[-30:])
-                    report.append(f"TYPESCRIPT (tsc --noEmit): ✗\n{tail}")
+                    report.append(f"TYPESCRIPT ({tsc_label}): ✗\n{tail}")
                 else:
                     ignored = len(preexisting_errors) + len(env_mobile_errors)
                     report.append(
-                        f"TYPESCRIPT (tsc --noEmit): ✓ sin errores en archivos generados "
+                        f"TYPESCRIPT ({tsc_label}): ✓ sin errores en archivos generados "
                         f"(ignorados: {ignored} línea(s) pre-existentes o módulos mobile)"
                     )
 
@@ -1111,48 +1438,56 @@ def _validate_workspace(
             ".test." in f or (f.endswith(".spec.ts") and "e2e" not in f)
             for f in applied_files
         )
-        has_vitest_config = os.path.exists(os.path.join(workspace, "vitest.config.ts")) or \
-                            os.path.exists(os.path.join(workspace, "vitest.config.js"))
+        has_vitest_config = os.path.exists(os.path.join(effective_root, "vitest.config.ts")) or \
+                            os.path.exists(os.path.join(effective_root, "vitest.config.js"))
+        vitest_label = f"npx vitest run, {subproject}/" if subproject else "npx vitest run"
+        # El baseline (`_run_vitest_baseline`) siempre corre en la raíz del
+        # workspace, ANTES de saber si el ticket cae en un subproyecto — sus
+        # fallos no son comparables contra los de la suite de vitest de
+        # mobile/ (config, tests y hasta test runner distintos). Con
+        # subproyecto detectado, no lo usamos: cualquier fallo bloquea
+        # (mismo criterio estricto que cuando no hay baseline disponible).
+        effective_baseline = None if subproject else baseline_failing_tests
         if has_test_files or has_vitest_config:
             ran_any = True
             rc, out = _run(
                 ["node", "--max-old-space-size=2048", "./node_modules/.bin/vitest",
                  "run", "--reporter=verbose"],
-                cwd=workspace,
+                cwd=effective_root,
                 timeout=int(os.getenv("FLEET_VITEST_TIMEOUT", "180")),
             )
             tail = "\n".join(out.strip().splitlines()[-40:])
             if "Cannot find module" in out and "vitest" in out:
-                report.append("VITEST: ⚠ vitest no encontrado en node_modules — instala con npm install")
+                report.append(f"VITEST: ⚠ vitest no encontrado en node_modules de '{subproject or '.'}' — instala con npm install")
             elif rc == 0:
                 # Extraer resumen compacto de tests pasados
                 summary_match = _re.search(r'Test Files.*\n?.*Tests\s+\d+', out)
                 summary = summary_match.group(0).strip() if summary_match else f"exit 0"
-                report.append(f"VITEST (npx vitest run): ✓ {summary}\n{tail[-800:]}")
-            elif baseline_failing_tests is not None:
+                report.append(f"VITEST ({vitest_label}): ✓ {summary}\n{tail[-800:]}")
+            elif effective_baseline is not None:
                 # Requerimiento 10: aprobar por alcance del ticket, no exigir que
                 # TODA la suite esté verde. Solo bloquear si aparecen fallos
                 # NUEVOS que no estaban ya presentes antes de este despacho.
                 current_failing = _extract_failing_tests(out)
-                new_failures = current_failing - baseline_failing_tests
-                preexisting_still_failing = current_failing & baseline_failing_tests
+                new_failures = current_failing - effective_baseline
+                preexisting_still_failing = current_failing & effective_baseline
                 if new_failures:
                     ok = False
                     report.append(
-                        f"VITEST (npx vitest run): ✗ {len(new_failures)} fallo(s) NUEVO(S) "
+                        f"VITEST ({vitest_label}): ✗ {len(new_failures)} fallo(s) NUEVO(S) "
                         f"introducido(s) por este cambio (no relacionado con fallos "
                         f"preexistentes):\n" + "\n".join(sorted(new_failures)[:20])
                     )
                 else:
                     report.append(
-                        f"VITEST (npx vitest run): ✓ sin fallos nuevos "
+                        f"VITEST ({vitest_label}): ✓ sin fallos nuevos "
                         f"({len(preexisting_still_failing)} fallo(s) preexistente(s) "
                         f"no relacionados con este ticket, ya presentes antes del despacho, "
                         f"ignorados)\n{tail[-800:]}"
                     )
             else:
                 ok = False
-                report.append(f"VITEST (npx vitest run): ✗ exit {rc}\n{tail}")
+                report.append(f"VITEST ({vitest_label}): ✗ exit {rc}\n{tail}")
         else:
             report.append(
                 "VITEST: ⚠ no hay archivos *.test.ts ni vitest.config.ts detectados. "
@@ -1283,7 +1618,45 @@ def _check_prisma_regression(old: str, new: str) -> List[str]:
     return issues
 
 
-def _check_ts_exports_regression(old: str, new: str) -> List[str]:
+# Requerimiento 21: verbos que, junto con el nombre exacto de una función/
+# export entre backticks, declaran una eliminación INTENCIONAL pedida por el
+# propio ticket ("eliminar `markAttendanceForClass`", "borrar `X` y su helper
+# `Y`"). Sin esto, el guard de regresión de exports no distingue "el ticket
+# pidió borrar X" de "el generador corrompió el archivo y perdió X sin
+# querer" — y revertía la eliminación pedida en cada ciclo, sin poder
+# converger nunca (caso real: TASK-d11c44eb, 6 ciclos agotados).
+_INTENTIONAL_REMOVAL_MARKERS = (
+    "eliminar", "elimina", "eliminá", "borrar", "borra", "borrá",
+    "remove", "delete",
+)
+
+
+def _find_intentionally_removed_exports(criteria: str) -> set:
+    """Nombres de función/export que el requerimiento pide eliminar
+    explícitamente por nombre (requerimiento 21). Solo captura identificadores
+    entre backticks cercanos a un verbo de eliminación (`_INTENTIONAL_REMOVAL_
+    MARKERS`) — igual que el resto de las guardas de esta sección, que asumen
+    que el requerimiento cita nombres de archivo/función entre backticks. Un
+    export que coincide exactamente con uno de estos nombres no cuenta como
+    regresión en `_check_ts_exports_regression`; cualquier otro export perdido
+    sigue rechazándose normalmente."""
+    if not criteria:
+        return set()
+    names = set()
+    lower = criteria.lower()
+    for marker in _INTENTIONAL_REMOVAL_MARKERS:
+        start = 0
+        while True:
+            idx = lower.find(marker, start)
+            if idx == -1:
+                break
+            window = criteria[idx: idx + 200]
+            names.update(_re.findall(r"`(\w+)`", window))
+            start = idx + len(marker)
+    return names
+
+
+def _check_ts_exports_regression(old: str, new: str, criteria: str = "") -> List[str]:
     """Detecta exports de TypeScript/JS eliminados en la versión generada.
 
     Cubre `export [async] function/class/const/type/interface/enum NOMBRE` — lo
@@ -1291,11 +1664,16 @@ def _check_ts_exports_regression(old: str, new: str) -> List[str]:
     PUT/DELETE/PATCH`) en archivos route.ts. Ver requerimiento 16: un ciclo
     reescribió un route.ts bajo ALLOW_REWRITE y perdió el handler GET; esta
     comparación lo marca como regresión — ALLOW_REWRITE autoriza reescribir el
-    contenido, NO perder capacidades públicas del archivo."""
+    contenido, NO perder capacidades públicas del archivo.
+
+    Requerimiento 21: los exports que el propio `criteria` pide eliminar por
+    nombre (`_find_intentionally_removed_exports`) se excluyen del cómputo de
+    "removidos" — su desaparición es el resultado pedido, no una regresión.
+    Si además desaparece algo NO pedido, eso sigue reportándose."""
     pat = r'^export\s+(?:async\s+)?(?:function|class|const|type|interface|enum)\s+(\w+)'
     old_exports = set(_re.findall(pat, old, _re.MULTILINE))
     new_exports = set(_re.findall(pat, new, _re.MULTILINE))
-    removed = old_exports - new_exports
+    removed = old_exports - new_exports - _find_intentionally_removed_exports(criteria)
     if removed:
         _HTTP_HANDLERS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
         http_lost = sorted(removed & _HTTP_HANDLERS)
@@ -1319,6 +1697,35 @@ def _git_original_content(workspace: str, rel_path: str) -> Optional[str]:
     existía en HEAD (archivo nuevo del ticket) o si git no está disponible."""
     rc, out = _git(["show", f"HEAD:{rel_path}"], workspace)
     return out if rc == 0 else None
+
+
+def _no_effective_changes(workspace: str, applied_files: list, existing_files: dict) -> bool:
+    """Requerimiento 20: True si TODOS los archivos "aplicados" en este ciclo
+    son byte-idénticos a su contenido previo (`existing_files`) — el
+    generador escribió los archivos pero no cambió nada en la práctica.
+
+    Un archivo nuevo (no estaba en `existing_files`) o uno eliminado siempre
+    cuenta como cambio real. Si algún archivo aplicado no se puede comparar
+    (no está en disco por otra razón, o falla la lectura), se asume
+    conservadoramente que SÍ hay cambio — esta guarda solo debe activarse
+    cuando la ausencia de cambio es inequívoca."""
+    if not applied_files:
+        return False
+    for rel in applied_files:
+        full = os.path.join(workspace, rel)
+        old_content = existing_files.get(rel)
+        if old_content is None:
+            return False  # archivo nuevo del ticket -> hay cambio
+        if not os.path.isfile(full):
+            return False
+        try:
+            with open(full, errors="replace") as fh:
+                new_content = fh.read()
+        except Exception:
+            return False
+        if new_content != old_content:
+            return False
+    return True
 
 
 # ===========================================================================
@@ -1613,15 +2020,12 @@ def codebase_reader_node(state: FleetState) -> dict:
     # filesystem), y el modelo termina alucinando una versión propia del
     # contenido a partir del nombre/descripción (ver requerimiento 08).
     text = "\n".join(subtasks) + "\n" + criteria
-    # Los corchetes `[]` en la clase permiten capturar rutas dinámicas de
-    # Next.js (ej. `src/app/api/messages/[conversationId]/route.ts`) —
-    # requerimiento 16: sin ellos, esos archivos nunca se leían como contexto
-    # ni se comparaban en regression_guard, y una pérdida de handler pasaba
-    # inadvertida.
-    found = _re.findall(
-        r'[\w/\-\.\[\]]+\.(?:ts|tsx|js|prisma|sql|rb|py|go|rs|json|yaml|yml|md)',
-        text
-    )
+    # Usa el mismo _FILE_PATH_RE que _is_out_of_scope/_find_explicitly_forbidden_files
+    # (antes tenía su propia copia del regex, desincronizada — el fix del req
+    # 16 para corchetes `[]` de rutas dinámicas de Next.js nunca se propagó
+    # acá, y el mismo hueco reapareció con paréntesis `()` de route groups en
+    # el req 19; unificar en la constante compartida evita que se repita).
+    found = _re.findall(_FILE_PATH_RE, text)
     candidates = list(dict.fromkeys(
         _KEY_FILES_BY_STACK.get(stack, []) + found
     ))
@@ -1669,6 +2073,7 @@ def regression_guard_node(state: FleetState) -> dict:
     workspace      = state["workspace_path"]
     existing_files = dict(state.get("existing_files", {}))
     applied_files  = set(state.get("applied_files", []))
+    criteria       = state.get("acceptance_criteria", "")
 
     # Requerimiento 16: augmentar existing_files con el 'antes' desde git para
     # cualquier archivo aplicado que codebase_reader no capturó (rutas
@@ -1707,7 +2112,7 @@ def regression_guard_node(state: FleetState) -> dict:
                 file_issues.extend(_check_prisma_regression(old_content, new_content))
             elif rel.endswith((".ts", ".tsx", ".js")):
                 file_issues.extend(
-                    f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content)
+                    f"{rel}: {e}" for e in _check_ts_exports_regression(old_content, new_content, criteria)
                 )
 
         if file_issues:
@@ -1962,6 +2367,31 @@ def validation_gate_node(state: FleetState) -> dict:
         return {"validation_passed": False,
                 "validation_report": "No se generó ningún archivo.",
                 "messages": [AIMessage(content="Validación: sin archivos", name="Validator")]}
+
+    # Requerimiento 20: un ciclo cuyos archivos "aplicados" son todos
+    # byte-idénticos a su contenido previo no hizo ningún cambio real — caso
+    # real observado: un ticket pedía que la Flota ejecutara un `git merge`
+    # con resolución de conflicto (operación que el pipeline actual no sabe
+    # ejecutar; el dynamic_developer solo escribe diffs de archivos). El LLM
+    # devolvió el archivo tal cual estaba, los mismos tests que ya pasaban
+    # siguieron pasando, y el ciclo terminaba reportado como
+    # "✅ Aprobado+validado" sin ningún commit real (rama idéntica a la base,
+    # sin PR). Sin diff efectivo, no hay nada que aprobar.
+    existing_files = state.get("existing_files", {})
+    if _no_effective_changes(workspace, applied_files, existing_files):
+        _log("[validation_gate] Ciclo sin cambios efectivos (archivos idénticos al original).")
+        return {
+            "validation_passed": False,
+            "validation_report": (
+                "Sin cambios producidos: todos los archivos aplicados son idénticos "
+                "a su contenido original — no se realizó ningún cambio real. Si el "
+                "requerimiento pide una operación de Git (merge/rebase/cherry-pick) "
+                "más allá de editar archivos de código, ese flujo no está soportado "
+                "por este pipeline; debe resolverse manualmente o reformularse como "
+                "una edición de archivo explícita."
+            ),
+            "messages": [AIMessage(content="Validación: sin cambios efectivos", name="Validator")],
+        }
 
     # Si regression_guard ya detectó regresiones, no correr tsc — el reporte ya está listo
     regression_errors = state.get("regression_errors", [])

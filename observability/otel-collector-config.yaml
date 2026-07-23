@@ -1,0 +1,58 @@
+# OpenTelemetry Collector de la flota.
+#
+# Rol: recibe las trazas OTLP de fleet-api, las reenvía a Jaeger (tab Search)
+# y, en paralelo, deriva métricas RED (Rate/Error/Duration) desde los spans
+# con el conector `spanmetrics` y las expone para Prometheus. Esas métricas
+# son las que alimentan el tab "Monitor" (SPM) de Jaeger.
+#
+# La flota nunca envía prompts en los spans (ver fleet_tracing.py, Req 6.6),
+# así que las métricas derivadas solo contienen nombres, contadores y duraciones.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+connectors:
+  # Genera calls_total y duration (histograma) agrupados por service.name +
+  # operación (nombre del span) + span.kind + status.code.
+  span_metrics:
+    histogram:
+      explicit:
+        # Buckets ajustados a la realidad de la flota: los llm.invoke tardan
+        # segundos, no milisegundos, así que extendemos hasta 120s.
+        buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s, 20s, 30s, 60s, 120s]
+    # Dimensiones extra para poder desglosar en Prometheus/Grafana por nodo
+    # del grafo y por modelo. El tab Monitor de Jaeger agrupa por operación.
+    dimensions:
+      - name: fleet.node
+      - name: llm.model_name
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 15s
+
+exporters:
+  # Trazas → Jaeger vía OTLP gRPC.
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  # Métricas → endpoint que Prometheus scrapea.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp_grpc/jaeger, span_metrics]
+    metrics/spanmetrics:
+      receivers: [span_metrics]
+      exporters: [prometheus]

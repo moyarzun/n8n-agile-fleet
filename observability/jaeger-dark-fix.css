@@ -1,0 +1,81 @@
+/*
+ * Arreglo del modo oscuro de Jaeger UI v1.76 (inyectado por el proxy nginx).
+ *
+ * Bug: el tema dark de Jaeger aplica data-theme="dark" y pone el TEXTO en color
+ * claro (rgba(244,248,255,...)), pero nunca aplica el FONDO oscuro (html/body/
+ * #jaeger-ui-root quedan transparentes → blanco del navegador). Resultado:
+ *  - Sin "Auto Dark Mode" de Chrome: texto claro sobre fondo blanco (ilegible).
+ *  - Con "Auto Dark Mode" de Chrome: la página se re-invierte → texto oscuro
+ *    sobre fondo oscuro (ilegible).
+ *
+ * Fix: aportar el fondo oscuro que falta y declarar color-scheme:dark para que
+ * el force-dark de Chrome respete el dark nativo y no lo re-invierta.
+ */
+:root { color-scheme: dark !important; }
+html, body, #jaeger-ui-root { background-color: #141a24 !important; }
+
+/* Tabla de operaciones: heredar el fondo oscuro; hover legible */
+.ant-table, .ant-table-container, .ant-table-thead > tr > th,
+.ant-table-tbody > tr > td, .ant-table-cell { background-color: transparent !important; }
+.ant-table-tbody > tr:hover > td, .ant-table-cell-row-hover { background-color: #1e2735 !important; }
+
+/* Tarjetas de gráficos y ejes (recharts pinta un rect blanco de fondo) */
+.graph-container { background-color: #1a2130 !important; border-radius: 6px; }
+.recharts-surface { background-color: transparent !important; }
+.recharts-cartesian-grid line { stroke: #2c3648 !important; }
+.recharts-text tspan, .recharts-cartesian-axis-tick-value tspan { fill: rgba(244,248,255,0.65) !important; }
+rect[fill="#fff"], rect[fill="#ffffff"], rect[fill="white"] { fill: #1a2130 !important; }
+
+/* Banner de aviso de Jaeger */
+.ant-alert-warning { background-color: #2a2410 !important; border-color: #5c4a12 !important; }
+.ant-alert-warning .ant-alert-message, .ant-alert-warning a { color: #f4d35e !important; }
+
+/* Inputs y selects */
+.ant-input, .ant-input-affix-wrapper, .ant-select-selector {
+  background-color: #1a2130 !important; color: rgba(244,248,255,0.92) !important; border-color: #2c3648 !important;
+}
+.ant-input::placeholder { color: rgba(244,248,255,0.4) !important; }
+
+/* Barra de navegación superior: los <a> heredan el negro del body sobre el
+ * fondo oscuro del navbar. Texto claro en los items normales; oscuro en el
+ * item seleccionado (su fondo es teal, donde el contraste oscuro es mejor). */
+.Page--topNav a { color: rgba(244,248,255,0.92) !important; }
+.Page--topNav .ant-menu-item-selected a { color: #0f141c !important; }
+.Page--topNav .ant-menu-item:hover a { color: #ffffff !important; }
+
+/* Iconos de ordenamiento en los headers de la tabla: heredan el negro
+ * (rgba(0,0,0,0.294)) sobre fondo oscuro. Tenue-visible en reposo, teal al
+ * estar activos, un poco más brillante al hover de la columna. */
+.ant-table-column-sorter-up, .ant-table-column-sorter-down { color: rgba(244,248,255,0.35) !important; }
+.ant-table-column-sorter-up.active, .ant-table-column-sorter-down.active { color: #4fd0e0 !important; }
+.ant-table-column-sorters:hover .ant-table-column-sorter { color: rgba(244,248,255,0.55) !important; }
+
+/* Vista de trazas (Trace Timeline): la cabecera, la fila de stats, el minimap
+ * y el header de la timeline traen fondos claros hardcodeados (#fff/#eee/#ececec),
+ * y varios textos (nombre de servicio, toggles del árbol) van en negro. Con
+ * fondos oscuros el "Auto Dark Mode" de Chrome ya no los invierte y quedan
+ * legibles en ambos casos (con y sin ese modo). */
+.Tracepage--headerSection, .TracePageHeader--titleRow { background-color: #141a24 !important; }
+.TracePageHeader--overviewItems { background-color: #1a2130 !important; }
+.Tracepage--headerSection .ub-pb2.ub-px2 { background-color: #141a24 !important; }
+.CanvasSpanGraph { background-color: #1a2130 !important; }
+.TimelineHeaderRow { background-color: #1a2130 !important; }
+.span-name-wrapper { background-color: transparent !important; }
+.span-row:hover .span-name-wrapper, .span-row.is-expanded .span-name-wrapper { background-color: #1e2735 !important; }
+.span-svc-name, .span-operation-name { color: rgba(244,248,255,0.92) !important; }
+.SpanTreeOffset, .SpanTreeOffset--iconWrapper, .SpanTreeOffset a { color: rgba(244,248,255,0.65) !important; }
+.TracePageHeader--overviewItems, .TracePageHeader--overviewItems * { color: rgba(244,248,255,0.85) !important; }
+.TracePageHeader--traceName { color: rgba(244,248,255,0.92) !important; }
+.TickLabels--label { color: rgba(244,248,255,0.55) !important; }
+
+/* Botón "atrás" del header de la traza: fondo blanco (#fafafa) hardcodeado
+ * detrás de la flecha, sobre el header oscuro. */
+.TracePageHeader--back { background-color: #1a2130 !important; }
+.TracePageHeader--back:hover { background-color: #1e2735 !important; }
+
+/* Panel de detalle del span (se abre/hover al clickear una fila): el fondo
+ * claro (#f5f5f5/#f8f8f8) queda hardcodeado y el texto claro del tema dark
+ * se vuelve ilegible encima. */
+.span-view:hover, .ub-relative.span-view:hover { background-color: #1e2735 !important; }
+.detail-info-wrapper { background-color: #1a2130 !important; }
+.detail-info-wrapper .ant-divider { border-color: #2c3648 !important; }

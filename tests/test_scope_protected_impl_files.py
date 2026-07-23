@@ -285,3 +285,211 @@ def test_requerimiento_sin_rutas_no_activa_guarda_de_alcance(real_fleet, tmp_pat
 
     assert applied == ["src/cualquier-cosa.ts"]
     assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 17: falso positivo de la guarda de exclusión explícita (req 15)
+# con frases allow-list ("fuera de") y con "no reescribas X, solo agrega Y".
+# ---------------------------------------------------------------------------
+
+def test_fuera_de_no_agrega_el_path_a_prohibidos(real_fleet):
+    """Criterio de aceptación 1/2 (caso exacto del hallazgo): 'no toques
+    ningún archivo fuera de X' es un allow-list — X no debe quedar prohibido."""
+    criteria = (
+        "NO toques ningún archivo fuera de `src/lib/waitlist.ts`, "
+        "`src/lib/waitlist.test.ts`, `src/app/api/waitlist/route.ts`."
+    )
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/lib/waitlist.ts" not in forbidden
+
+
+def test_fuera_de_no_rechaza_la_escritura_del_archivo_permitido(real_fleet, tmp_path):
+    """Criterio de aceptación 2: reproduce el caso exacto — con la frase
+    'fuera de', escribir src/lib/waitlist.ts (el archivo permitido, no el
+    prohibido) no debe ser rechazado por la guarda de exclusión explícita."""
+    lib = tmp_path / "src" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "waitlist.ts").write_text("export function old() {}\n")
+
+    criteria = "NO toques ningún archivo fuera de `src/lib/waitlist.ts`."
+    llm_response = _file_block("src/lib/waitlist.ts", "export function promoteNextInWaitlist() {}\n")
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.ts"]
+    assert rejected == []
+
+
+@pytest.mark.parametrize("qualifier", ["excepto", "salvo", "que no sea", "distinto de"])
+def test_otros_calificadores_de_inversion_tambien_invalidan_la_prohibicion(real_fleet, qualifier):
+    """Criterio de aceptación 1: variantes de 'fuera de' — excepto/salvo/que no
+    sea/distinto de — deben comportarse igual."""
+    criteria = f"No modifiques ningún archivo {qualifier} `src/lib/waitlist.ts` en este ticket."
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/lib/waitlist.ts" not in forbidden
+
+
+def test_sin_calificador_de_inversion_sigue_prohibiendo_como_antes(real_fleet):
+    """No regression: 'no modifiques X' sin calificador de inversión (el caso
+    que req 15 ya cubría) sigue prohibiendo X con normalidad."""
+    criteria = "No modifiques `src/server/auth/context.ts` en este ticket."
+    forbidden = real_fleet._find_explicitly_forbidden_files(criteria)
+    assert "src/server/auth/context.ts" in forbidden
+
+
+def test_is_out_of_scope_sigue_rechazando_el_complementario_con_fuera_de(real_fleet, tmp_path):
+    """Criterio de aceptación 3: con una frase 'fuera de', un archivo EXISTENTE
+    que sí está fuera de los paths permitidos debe seguir siendo rechazado —
+    por `_is_out_of_scope`, no por la guarda de exclusión explícita."""
+    (tmp_path / "src" / "lib").mkdir(parents=True)
+    (tmp_path / "src" / "server").mkdir(parents=True)
+    (tmp_path / "src" / "lib" / "waitlist.ts").write_text("export function old() {}\n")
+    (tmp_path / "src" / "server" / "errors.ts").write_text("export class AppError {}\n")
+
+    criteria = "NO toques ningún archivo fuera de `src/lib/waitlist.ts`."
+    llm_response = (
+        _file_block("src/lib/waitlist.ts", "export function promoteNextInWaitlist() {}\n")
+        + "\n" + _file_block("src/server/errors.ts", "export class AppError extends Error {}\n")
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.ts"]
+    assert len(rejected) == 1
+    assert "errors.ts" in rejected[0]
+
+
+def test_no_reescribas_con_edicion_acotada_no_bloquea_por_nombre(real_fleet, tmp_path):
+    """Criterio de aceptación 4: reproduce TASK-ce8abf86/TASK-4bdedf6f — 'no
+    reescribas X, solo agrega Y' ya no dispara la guarda de exclusión
+    explícita por nombre; una edición chica (no una reescritura completa) se
+    aplica con normalidad."""
+    lib = tmp_path / "src" / "lib"
+    lib.mkdir(parents=True)
+    original = (
+        "import { describe, it, expect } from 'vitest';\n\n"
+        "describe('promoteNextInWaitlist', () => {\n"
+        "  it('test 1', () => { expect(true).toBe(true); });\n"
+        "  it('test 2', () => { expect(true).toBe(true); });\n"
+        "  it('test 3', () => { expect(true).toBe(true); });\n"
+        "  it('test 4', () => { expect(true).toBe(true); });\n"
+        "});\n"
+    )
+    (lib / "waitlist.test.ts").write_text(original)
+
+    criteria = (
+        "src/lib/waitlist.test.ts (archivo YA EXISTENTE con 4 tests — "
+        "NO reescribas el archivo, solo AGREGA un test nuevo al final del "
+        "describe existente)."
+    )
+    edited = original.replace(
+        "});\n",
+        "  it('test 5 nuevo', () => { expect(true).toBe(true); });\n});\n",
+        1,
+    )
+    llm_response = _file_block("src/lib/waitlist.test.ts", edited)
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["src/lib/waitlist.test.ts"]
+    assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Requerimiento 19: _FILE_PATH_RE no reconocía paréntesis literales en rutas
+# de archivo — "route groups" de Next.js App Router / Expo Router (`(tabs)`,
+# `(marketing)`) cortaban la ruta en el paréntesis y la guarda de alcance
+# nunca reconocía el path real.
+# ---------------------------------------------------------------------------
+
+def test_mentioned_file_paths_no_trunca_tsx_a_ts(real_fleet):
+    """Bug encontrado escribiendo los tests del req 19 (no reportado en el
+    hallazgo original, pero mismo mecanismo — _FILE_PATH_RE): la alternación
+    de extensiones probaba 'ts' antes que 'tsx', truncando CUALQUIER mención
+    de un archivo .tsx a .ts (y 'package.json' a 'package.js', por el mismo
+    problema con 'js' antes de 'json')."""
+    mentioned = real_fleet._mentioned_file_paths("Edita src/components/Foo.tsx por favor.")
+    assert "src/components/Foo.tsx" in mentioned
+    assert "src/components/Foo.ts" not in mentioned
+
+    mentioned_json = real_fleet._mentioned_file_paths("Agrega una dependencia a package.json.")
+    assert "package.json" in mentioned_json
+    assert "package.js" not in mentioned_json
+
+
+def test_mentioned_file_paths_reconoce_parentesis_de_route_group(real_fleet):
+    """Criterio de aceptación 1 (caso exacto del hallazgo): el path con
+    'route group' de Expo Router debe extraerse completo, no cortado en '('."""
+    criteria = "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`."
+    mentioned = real_fleet._mentioned_file_paths(criteria)
+    assert "mobile/app/(tabs)/index.tsx" in mentioned
+
+
+def test_ticket_sobre_archivo_con_route_group_no_se_rechaza_por_alcance(real_fleet, tmp_path):
+    """Criterio de aceptación 2: reproduce TASK-80de0a0a — un requerimiento
+    que menciona únicamente mobile/app/(tabs)/index.tsx como alcance permitido,
+    y un ticket que efectivamente escribe ahí, no debe rechazarse."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    (tabs_dir / "index.tsx").write_text("export default function Index() { return null; }\n")
+
+    criteria = (
+        "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx` (el path del archivo "
+        "tiene paréntesis literales en el nombre de carpeta \"(tabs)\", tenlo en "
+        "cuenta al escribir la ruta exacta)."
+    )
+    llm_response = _file_block(
+        "mobile/app/(tabs)/index.tsx",
+        "export default function Index() { return <View />; }\n",
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/app/(tabs)/index.tsx"]
+    assert rejected == []
+
+
+def test_archivo_fuera_del_route_group_mencionado_sigue_rechazado(real_fleet, tmp_path):
+    """No regression: con un path con paréntesis correctamente reconocido, un
+    archivo EXISTENTE distinto y fuera de ese árbol sigue rechazándose por la
+    guarda de alcance — el fix no desactiva la protección, solo repara el
+    parseo del path con paréntesis."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    (tabs_dir / "index.tsx").write_text("export default function Index() { return null; }\n")
+    other_dir = tmp_path / "mobile" / "lib"
+    other_dir.mkdir(parents=True)
+    (other_dir / "unrelated.ts").write_text("export const x = 1;\n")
+
+    criteria = "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`."
+    llm_response = (
+        _file_block("mobile/app/(tabs)/index.tsx", "export default function Index() { return <View />; }\n")
+        + "\n" + _file_block("mobile/lib/unrelated.ts", "export const x = 2;\n")
+    )
+
+    applied, rejected = real_fleet._apply_workspace_changes(str(tmp_path), llm_response, criteria=criteria)
+
+    assert applied == ["mobile/app/(tabs)/index.tsx"]
+    assert len(rejected) == 1
+    assert "unrelated.ts" in rejected[0]
+
+
+def test_codebase_reader_lee_archivo_con_route_group_como_contexto(real_fleet, tmp_path):
+    """Criterio de investigación 2: codebase_reader_node (ahora unificado con
+    _FILE_PATH_RE) debe capturar el contenido real de un archivo con
+    paréntesis en el path como contexto, no solo la guarda de alcance."""
+    tabs_dir = tmp_path / "mobile" / "app" / "(tabs)"
+    tabs_dir.mkdir(parents=True)
+    original = "export default function Index() { return null; }\n"
+    (tabs_dir / "index.tsx").write_text(original)
+
+    state = {
+        "workspace_path": str(tmp_path),
+        "stack": "generic",
+        "subtasks": [],
+        "acceptance_criteria": "Alcance permitido: SOLO `mobile/app/(tabs)/index.tsx`.",
+    }
+    result = real_fleet.codebase_reader_node(state)
+    existing = result["existing_files"]
+    assert "mobile/app/(tabs)/index.tsx" in existing
+    assert existing["mobile/app/(tabs)/index.tsx"] == original

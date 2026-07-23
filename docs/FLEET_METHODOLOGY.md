@@ -165,6 +165,16 @@ Todos los tests deben ejecutar y pasar con `npx vitest run`.
 4. **Comando del proyecto**: `FLEET_VALIDATE_CMD`, o `bin/fleet-validate`, o `make validate`.
    Aquí el proyecto corre **sus** tests con su toolchain.
 
+> **Subproyectos con su propio package.json (requerimiento 18).** Si el 100% de los
+> archivos del ticket cae bajo un único subdirectorio que tiene su propio
+> `package.json` (ej. `mobile/` en un monorepo Next.js + Expo), pasos 2 y 3 corren
+> con `cwd` en ESE subdirectorio en vez de la raíz — el `tsconfig`/`package.json` de
+> la raíz no incluye ese código, así que correr ahí daba "✓ validado" sin cobertura
+> real. `_find_subproject_root` detecta el caso; el reporte lo marca explícitamente
+> ("SUBPROYECTO DETECTADO"). El baseline de fallos preexistentes de Vitest (paso 3,
+> requerimiento 10) se calcula siempre en la raíz — no es comparable contra la suite
+> del subproyecto, así que ahí se cae a modo estricto (cualquier fallo bloquea).
+
 > **bin/fleet-validate (v3).** Cada proyecto debe tener `bin/fleet-validate` — un script
 > ejecutable que corre TypeScript + Vitest + cualquier otro check del proyecto.
 > La Flota lo llama automáticamente si existe.
@@ -182,6 +192,19 @@ Codificadas en `ENGINEERING_GUARDRAILS_*` (langgraph_fleet.py). Resumen:
 - **Grounding**: no inventar modelos; alinear al código existente.
 - **No placeholders**: `...`, `# TODO`, `# resto` = rechazo.
 - **Archivos completos**: el último carácter de FILE_BEGIN/END es el cierre real.
+- **Limitación conocida (requerimiento 18) — sin ejecución real de instalación**:
+  `dynamic_developer` es una llamada a un LLM que devuelve `FILE_BEGIN/END`, no un
+  agente con herramientas — no puede correr `npm install`, `npx expo install
+  --check`, `bundle install`, ni ningún comando de instalación real. Si el
+  requerimiento pide "correr" uno de esos comandos, el modelo alucina el
+  `package.json`/manifest resultante en vez de aplicar el cambio puntual. **Quien
+  despache debe evitar pedir "corre npm install X"** y en su lugar especificar
+  exactamente qué línea agregar al manifest (ej. "agrega `"jest-expo": "~54.0.0"`
+  a devDependencies"). El prompt del dev ya trae esta instrucción, y una guarda
+  determinista (`_find_unauthorized_package_json_dependency_changes`) rechaza
+  entero cualquier `package.json` que cambie de versión o elimine una dependencia
+  preexistente no mencionada por nombre — pero la guarda solo cubre npm/`package.json`;
+  no hay guarda equivalente todavía para `Gemfile`/`requirements.txt`.
 
 ### Rails:
 - Triangulación spec↔factory↔tabla obligatoria.
